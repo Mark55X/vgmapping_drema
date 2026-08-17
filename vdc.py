@@ -120,7 +120,8 @@ class VariationAwareDensityController:
         rendered_depth: torch.Tensor,
         intrinsic: torch.Tensor,
         pose: torch.Tensor,
-        tsdf_map: TSDFVoxelMap
+        tsdf_map: TSDFVoxelMap,
+        mask_obs: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Runs vectorized AVD and GVD passes over quadtree image patches to initialize new Gaussian primitives.
@@ -131,7 +132,8 @@ class VariationAwareDensityController:
                 'xyz': torch.empty((0, 3), device=self.device),
                 'rgb': torch.empty((0, 3), device=self.device),
                 'scale': torch.empty((0, 3), device=self.device),
-                'morton': torch.empty((0,), dtype=torch.int64, device=self.device)
+                'morton': torch.empty((0,), dtype=torch.int64, device=self.device),
+                'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device)
             }
 
         ssim_map = compute_ssim_map(rendered_rgb, rgb_obs).squeeze() # (H, W)
@@ -160,7 +162,8 @@ class VariationAwareDensityController:
                 'xyz': torch.empty((0, 3), device=self.device),
                 'rgb': torch.empty((0, 3), device=self.device),
                 'scale': torch.empty((0, 3), device=self.device),
-                'morton': torch.empty((0,), dtype=torch.int64, device=self.device)
+                'morton': torch.empty((0,), dtype=torch.int64, device=self.device),
+                'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device)
             }
 
         d_vals = depth_obs[0, v_c, u_c]
@@ -176,7 +179,8 @@ class VariationAwareDensityController:
                 'xyz': torch.empty((0, 3), device=self.device),
                 'rgb': torch.empty((0, 3), device=self.device),
                 'scale': torch.empty((0, 3), device=self.device),
-                'morton': torch.empty((0,), dtype=torch.int64, device=self.device)
+                'morton': torch.empty((0,), dtype=torch.int64, device=self.device),
+                'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device)
             }
 
         # 1. Appearance-based Variation Detection (AVD)
@@ -199,7 +203,8 @@ class VariationAwareDensityController:
                 'xyz': torch.empty((0, 3), device=self.device),
                 'rgb': torch.empty((0, 3), device=self.device),
                 'scale': torch.empty((0, 3), device=self.device),
-                'morton': torch.empty((0,), dtype=torch.int64, device=self.device)
+                'morton': torch.empty((0,), dtype=torch.int64, device=self.device),
+                'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device)
             }
 
         p_world_init = p_world[init_mask]
@@ -222,11 +227,17 @@ class VariationAwareDensityController:
         rgb_vals = rgb_obs[:, v_init, u_init].T # (N_init, 3)
         morton_vals = tsdf_map.point_to_morton(p_world_init) # (N_init,)
 
+        if mask_obs is not None:
+            obj_id_vals = mask_obs[v_init, u_init].to(torch.int32)
+        else:
+            obj_id_vals = torch.zeros(len(p_world_init), dtype=torch.int32, device=self.device)
+
         return {
             'xyz': p_world_init,
             'rgb': rgb_vals,
             'scale': S_diag,
-            'morton': morton_vals
+            'morton': morton_vals,
+            'obj_id': obj_id_vals
         }
 
     def prune_gaussians_via_morton(
