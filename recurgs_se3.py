@@ -82,15 +82,15 @@ def icp_coarse_alignment(source_points: torch.Tensor, target_points: torch.Tenso
             Vt_copy[2, :] *= -1
             R = Vt_copy.T @ U.T
 
-        t = tgt_mean.T - R @ src_mean.T
+        t = tgt_mean.squeeze() - src_mean.squeeze() @ R.T
 
         # Update transformed src
-        src = (R @ src.T + t).T
+        src = src @ R.T + t
 
         # Accumulate T
         T_step = torch.eye(4, device=device)
         T_step[:3, :3] = R
-        T_step[:3, 3] = t.squeeze()
+        T_step[:3, 3] = t
         T_accum = T_step @ T_accum
 
     return T_accum
@@ -143,7 +143,7 @@ class RecurGSLieAlgebraAligner(nn.Module):
         src_rgb = object_gaussians['rgb'].to(device)
 
         # Apply initial coarse transformation
-        src_xyz_coarse = (initial_T_coarse[:3, :3] @ src_xyz.T + initial_T_coarse[:3, 3:4]).T
+        src_xyz_coarse = src_xyz @ initial_T_coarse[:3, :3].T + initial_T_coarse[:3, 3]
 
         H, W = gt_rgb.shape[1], gt_rgb.shape[2]
         fx, fy = intrinsic[0, 0].item(), intrinsic[1, 1].item()
@@ -162,7 +162,7 @@ class RecurGSLieAlgebraAligner(nn.Module):
             t_xi = T_xi[:3, 3]
 
             # Transform points
-            transformed_xyz = (R_xi @ src_xyz_coarse.T + t_xi.unsqueeze(1)).T
+            transformed_xyz = src_xyz_coarse @ R_xi.T + t_xi
 
             # Simple differentiable point splatting for pose optimization
             p_cam = transformed_xyz @ R_w2c.T + t_w2c
