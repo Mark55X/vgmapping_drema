@@ -123,81 +123,10 @@ class VariationAwareDensityController:
         tsdf_map: TSDFVoxelMap
     ) -> Dict[str, torch.Tensor]:
         """
-        Runs AVD and GVD passes over quadtree image patches to initialize new Gaussian primitives.
-        
-        Returns dictionary of Gaussian parameters:
-        - 'xyz': (N, 3)
-        - 'rgb': (N, 3)
-        - 'scale': (N, 3)
-        - 'morton': (N,) int64 Morton codes
+        Runs vectorized AVD and GVD passes over quadtree image patches to initialize new Gaussian primitives.
         """
         leaves = quadtree_segmentation(rgb_obs, min_size=4, max_size=32)
-        ssim_map = compute_ssim_map(rendered_rgb, rgb_obs).squeeze() # (H, W)
-
-        fx = intrinsic[0, 0].item()
-        fy = intrinsic[1, 1].item()
-        cx = intrinsic[0, 2].item()
-        cy = intrinsic[1, 2].item()
-
-        R_c2w = pose[:3, :3].to(self.device)
-        t_c2w = pose[:3, 3].to(self.device)
-
-        new_xyz_list = []
-        new_rgb_list = []
-        new_scale_list = []
-        new_morton_list = []
-
-        for patch in leaves:
-            u_c = patch.x + patch.size // 2
-            v_c = patch.y + patch.size // 2
-
-            H, W = rgb_obs.shape[1], rgb_obs.shape[2]
-            if u_c >= W or v_c >= H:
-                continue
-
-            # 1. Appearance-based Variation Detection (AVD)
-            patch_ssim = ssim_map[patch.y:patch.y+patch.size, patch.x:patch.x+patch.size].mean().item()
-            avd_flag = patch_ssim < self.tau_s
-
-            # Back-project patch center to 3D point p_c
-            d_val = depth_obs[0, v_c, u_c].item()
-            if d_val <= 0.1 or d_val > 5.0:
-                continue
-
-            x_cam = (u_c - cx) * d_val / fx
-            y_cam = (v_c - cy) * d_val / fy
-            p_cam = torch.tensor([x_cam, y_cam, d_val], dtype=torch.float32, device=self.device)
-            p_world = R_c2w @ p_cam + t_c2w
-
-            # 2. Geometry-based Variation Detection (GVD)
-            _, w_val = tsdf_map.query_tsdf_and_weight(p_world.unsqueeze(0))
-            gvd_flag = (w_val.item() <= 1.0) # Changed or uninitialized region
-
-            if avd_flag or gvd_flag:
-                # Initialize Gaussian primitive (Eq. 15-16)
-                # Compute gradient grad S(p_c) for normal n
-                grad_s = tsdf_map.compute_surface_normal(p_world.unsqueeze(0)).squeeze(0) # (3,)
-                
-                if torch.norm(grad_s) > 1e-5:
-                    n = 1.0 / (1.0 + torch.abs(grad_s))
-                else:
-                    n = torch.ones(3, device=self.device)
-
-                n_norm = n / (torch.norm(n) + 1e-6)
-
-                L = patch.size / 2.0
-                d_scale = (L * d_val) / fx
-                S_diag = d_scale * n_norm
-
-                rgb_val = rgb_obs[:, v_c, u_c]
-                morton_val = tsdf_map.point_to_morton(p_world.unsqueeze(0)).squeeze(0)
-
-                new_xyz_list.append(p_world)
-                new_rgb_list.append(rgb_val)
-                new_scale_list.append(S_diag)
-                new_morton_list.append(morton_val)
-
-        if len(new_xyz_list) == 0:
+        if len(leaves) == 0:
             return {
                 'xyz': torch.empty((0, 3), device=self.device),
                 'rgb': torch.empty((0, 3), device=self.device),
@@ -205,11 +134,99 @@ class VariationAwareDensityController:
                 'morton': torch.empty((0,), dtype=torch.int64, device=self.device)
             }
 
+        ssim_map = compute_ssim_map(rendered_rgb, rgb_obs).squeeze() # (H, W)
+        H, W = rgb_obs.shape[1], rgb_obs.shape[2]
+
+        fx = intrinsic[0, 0]
+        fy = intrinsic[1, 1]
+        cx = intrinsic[0, 2]
+        cy = intrinsic[1, 2]
+
+        R_c2w = pose[:3, :3].to(self.device)
+        t_c2w = pose[:3, 3].to(self.device)
+
+        # Vectorize patch properties
+        u_c = torch.tensor([p.x + p.size // 2 for p in leaves], dtype=torch.long, device=self.device)
+        v_c = torch.tensor([p.y + p.size // 2 for p in leaves], dtype=torch.long, device=self.device)
+        patch_sizes = torch.tensor([p.size for p in leaves], dtype=torch.float32, device=self.device)
+
+        valid_bounds = (u_c < W) & (v_c < H)
+        u_c = u_c[valid_bounds]
+        v_c = v_c[valid_bounds]
+        patch_sizes = patch_sizes[valid_bounds]
+
+        if len(u_c) == 0:
+            return {
+                'xyz': torch.empty((0, 3), device=self.device),
+                'rgb': torch.empty((0, 3), device=self.device),
+                'scale': torch.empty((0, 3), device=self.device),
+                'morton': torch.empty((0,), dtype=torch.int64, device=self.device)
+            }
+
+        d_vals = depth_obs[0, v_c, u_c]
+        valid_depth = (d_vals > 0.1) & (d_vals < 5.0)
+
+        u_c = u_c[valid_depth]
+        v_c = v_c[valid_depth]
+        patch_sizes = patch_sizes[valid_depth]
+        d_vals = d_vals[valid_depth]
+
+        if len(u_c) == 0:
+            return {
+                'xyz': torch.empty((0, 3), device=self.device),
+                'rgb': torch.empty((0, 3), device=self.device),
+                'scale': torch.empty((0, 3), device=self.device),
+                'morton': torch.empty((0,), dtype=torch.int64, device=self.device)
+            }
+
+        # 1. Appearance-based Variation Detection (AVD)
+        patch_ssim = ssim_map[v_c, u_c]
+        avd_flag = patch_ssim < self.tau_s
+
+        # Back-project to 3D world points
+        x_cam = (u_c.float() - cx) * d_vals / fx
+        y_cam = (v_c.float() - cy) * d_vals / fy
+        p_cam = torch.stack([x_cam, y_cam, d_vals], dim=-1) # (N, 3)
+        p_world = p_cam @ R_c2w.T + t_c2w # (N, 3)
+
+        # 2. Geometry-based Variation Detection (GVD) in batch
+        _, w_vals = tsdf_map.query_tsdf_and_weight(p_world)
+        gvd_flag = w_vals <= 1.0
+
+        init_mask = avd_flag | gvd_flag
+        if not torch.any(init_mask):
+            return {
+                'xyz': torch.empty((0, 3), device=self.device),
+                'rgb': torch.empty((0, 3), device=self.device),
+                'scale': torch.empty((0, 3), device=self.device),
+                'morton': torch.empty((0,), dtype=torch.int64, device=self.device)
+            }
+
+        p_world_init = p_world[init_mask]
+        u_init = u_c[init_mask]
+        v_init = v_c[init_mask]
+        patch_sizes_init = patch_sizes[init_mask]
+        d_vals_init = d_vals[init_mask]
+
+        # Compute surface normals in batch
+        grad_s = tsdf_map.compute_surface_normal(p_world_init) # (N_init, 3)
+        grad_norm = torch.norm(grad_s, dim=-1, keepdim=True)
+        
+        n = torch.where(grad_norm > 1e-5, 1.0 / (1.0 + torch.abs(grad_s)), torch.ones_like(grad_s))
+        n_norm = n / (torch.norm(n, dim=-1, keepdim=True) + 1e-6)
+
+        L = patch_sizes_init.unsqueeze(-1) / 2.0
+        d_scale = (L * d_vals_init.unsqueeze(-1)) / fx
+        S_diag = d_scale * n_norm
+
+        rgb_vals = rgb_obs[:, v_init, u_init].T # (N_init, 3)
+        morton_vals = tsdf_map.point_to_morton(p_world_init) # (N_init,)
+
         return {
-            'xyz': torch.stack(new_xyz_list, dim=0),
-            'rgb': torch.stack(new_rgb_list, dim=0),
-            'scale': torch.stack(new_scale_list, dim=0),
-            'morton': torch.stack(new_morton_list, dim=0)
+            'xyz': p_world_init,
+            'rgb': rgb_vals,
+            'scale': S_diag,
+            'morton': morton_vals
         }
 
     def prune_gaussians_via_morton(
@@ -219,14 +236,10 @@ class VariationAwareDensityController:
         pose: torch.Tensor,
         tsdf_map: TSDFVoxelMap,
         gaussian_morton_codes: torch.Tensor,
-        stride: int = 4
+        stride: int = 8
     ) -> torch.Tensor:
         """
-        Performs frustum ray-casting (Eq. 17) to identify deleted objects (TSDF < tau_p)
-        and floaters (TSDF > 0.95), matching Morton codes to create a boolean prune mask.
-        
-        gaussian_morton_codes: (N,) int64 Morton codes stored for current Gaussians.
-        Returns boolean prune mask (N,) where True indicates Gaussian to be pruned.
+        Vectorized frustum ray-casting (Eq. 17) in GPU batch.
         """
         if len(gaussian_morton_codes) == 0:
             return torch.zeros(0, dtype=torch.bool, device=self.device)
@@ -236,7 +249,7 @@ class VariationAwareDensityController:
 
         u_coords = torch.arange(0, W, stride, device=self.device)
         v_coords = torch.arange(0, H, stride, device=self.device)
-        grid_u, grid_v = torch.meshgrid(u_coords, v_coords, indexing="ij")
+        grid_v, grid_u = torch.meshgrid(v_coords, u_coords, indexing="ij")
         grid_u = grid_u.flatten()
         grid_v = grid_v.flatten()
 
@@ -247,46 +260,42 @@ class VariationAwareDensityController:
         grid_v = grid_v[valid_mask]
         depth_vals = depth_vals[valid_mask]
 
-        fx = intrinsic[0, 0].item()
-        fy = intrinsic[1, 1].item()
-        cx = intrinsic[0, 2].item()
-        cy = intrinsic[1, 2].item()
+        if len(grid_u) == 0:
+            return torch.zeros(len(gaussian_morton_codes), dtype=torch.bool, device=self.device)
+
+        fx = intrinsic[0, 0]
+        fy = intrinsic[1, 1]
+        cx = intrinsic[0, 2]
+        cy = intrinsic[1, 2]
 
         R_c2w = pose[:3, :3].to(self.device)
         t_c2w = pose[:3, 3].to(self.device)
 
-        prune_morton_set: Set[int] = set()
+        # Batch Ray Sampling
+        num_steps = 40
+        step_fractions = torch.linspace(0.0, 1.0, num_steps, device=self.device).view(1, -1) # (1, S)
+        z_start = self.n_p
+        z_end = torch.clamp(depth_vals - s, min=self.n_p).unsqueeze(1) # (R, 1)
+        z_samples = z_start + step_fractions * (z_end - z_start) # (R, S)
 
-        # Perform ray marching along sampled rays (Eq. 17)
-        for i in range(len(grid_u)):
-            u_i = grid_u[i].item()
-            v_i = grid_v[i].item()
-            d_max = depth_vals[i].item() - s
+        u_exp = grid_u.unsqueeze(1).expand(-1, num_steps) # (R, S)
+        v_exp = grid_v.unsqueeze(1).expand(-1, num_steps) # (R, S)
 
-            z_steps = torch.arange(self.n_p, max(self.n_p + s, d_max), step=s, device=self.device)
-            if len(z_steps) == 0:
-                continue
+        x_cam = (u_exp.float() - cx) * z_samples / fx
+        y_cam = (v_exp.float() - cy) * z_samples / fy
+        p_cam = torch.stack([x_cam, y_cam, z_samples], dim=-1) # (R, S, 3)
 
-            x_c = (u_i - cx) * z_steps / fx
-            y_c = (v_i - cy) * z_steps / fy
-            p_c = torch.stack([x_c, y_c, z_steps], dim=-1) # (Z, 3)
+        p_cam_flat = p_cam.reshape(-1, 3) # (R*S, 3)
+        p_w_flat = p_cam_flat @ R_c2w.T + t_c2w # (R*S, 3)
 
-            p_w = p_c @ R_c2w.T + t_c2w # (Z, 3)
+        f_vals, _ = tsdf_map.query_tsdf_and_weight(p_w_flat)
 
-            f_vals, _ = tsdf_map.query_tsdf_and_weight(p_w)
-            
-            # Condition: Deleted object (F < tau_p) OR Floater noise (F > 0.95)
-            prune_condition = (f_vals < self.tau_p) | (f_vals > 0.95)
-            if torch.any(prune_condition):
-                bad_points = p_w[prune_condition]
-                bad_mortons = tsdf_map.point_to_morton(bad_points).cpu().tolist()
-                prune_morton_set.update(bad_mortons)
-
-        if len(prune_morton_set) == 0:
+        prune_condition = (f_vals < self.tau_p) | (f_vals > 0.95)
+        if not torch.any(prune_condition):
             return torch.zeros(len(gaussian_morton_codes), dtype=torch.bool, device=self.device)
 
-        # Match Morton codes
-        prune_morton_tensor = torch.tensor(list(prune_morton_set), dtype=torch.int64, device=self.device)
-        prune_mask = torch.isin(gaussian_morton_codes, prune_morton_tensor)
+        bad_points = p_w_flat[prune_condition]
+        bad_mortons = tsdf_map.point_to_morton(bad_points).unique()
 
+        prune_mask = torch.isin(gaussian_morton_codes, bad_mortons)
         return prune_mask
