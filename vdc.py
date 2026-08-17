@@ -228,7 +228,13 @@ class VariationAwareDensityController:
         morton_vals = tsdf_map.point_to_morton(p_world_init) # (N_init,)
 
         if mask_obs is not None:
-            obj_id_vals = mask_obs[v_init, u_init].to(torch.int32)
+            if mask_obs.ndim == 3:
+                mask_obs = mask_obs[:, :, 0]
+            obj_id_vals = mask_obs[v_init, u_init].to(torch.int32).squeeze()
+            if obj_id_vals.ndim > 1:
+                obj_id_vals = obj_id_vals[:, 0]
+            elif obj_id_vals.ndim == 0:
+                obj_id_vals = obj_id_vals.unsqueeze(0)
         else:
             obj_id_vals = torch.zeros(len(p_world_init), dtype=torch.int32, device=self.device)
 
