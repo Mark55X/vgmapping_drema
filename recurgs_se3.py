@@ -139,8 +139,8 @@ class RecurGSLieAlgebraAligner(nn.Module):
         xi = nn.Parameter(torch.zeros(6, device=device, dtype=torch.float32))
         optimizer = torch.optim.Adam([xi], lr=lr)
 
-        src_xyz = object_gaussians['xyz'].to(device)
-        src_rgb = object_gaussians['rgb'].to(device)
+        src_xyz = object_gaussians['xyz'].to(device).reshape(-1, 3)
+        src_rgb = object_gaussians['rgb'].to(device).reshape(-1, 3)
 
         # Apply initial coarse transformation
         src_xyz_coarse = src_xyz @ initial_T_coarse[:3, :3].T + initial_T_coarse[:3, 3]
