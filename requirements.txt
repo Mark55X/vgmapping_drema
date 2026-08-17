@@ -1,0 +1,6 @@
+torch>=2.0.0
+numpy>=1.20.0
+scipy>=1.7.0
+scikit-image>=0.18.0
+PyMCubes>=0.1.2
+trimesh>=3.9.0
