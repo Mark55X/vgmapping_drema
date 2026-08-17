@@ -1,0 +1,12 @@
+README.md
+setup.py
+./__init__.py
+./pipeline.py
+./recurgs_se3.py
+./test_standalone.py
+./tsdf.py
+./vdc.py
+vg_mapping_recurgs_native.egg-info/PKG-INFO
+vg_mapping_recurgs_native.egg-info/SOURCES.txt
+vg_mapping_recurgs_native.egg-info/dependency_links.txt
+vg_mapping_recurgs_native.egg-info/top_level.txt
