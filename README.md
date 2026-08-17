@@ -25,6 +25,6 @@ This standalone Python package provides a complete implementation of:
 
 Run the standalone verification test suite:
 ```bash
-python3 vg_mapping_recurgs_native/test_standalone.py
+python3 vgmapping_drema/test_standalone.py
 ```
 # vgmapping_drema

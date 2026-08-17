@@ -1,0 +1,12 @@
+README.md
+setup.py
+./__init__.py
+./pipeline.py
+./recurgs_se3.py
+./test_standalone.py
+./tsdf.py
+./vdc.py
+vgmapping_drema.egg-info/PKG-INFO
+vgmapping_drema.egg-info/SOURCES.txt
+vgmapping_drema.egg-info/dependency_links.txt
+vgmapping_drema.egg-info/top_level.txt

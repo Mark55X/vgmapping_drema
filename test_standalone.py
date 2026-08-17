@@ -6,10 +6,10 @@ import os
 # Ensure package path is importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from vg_mapping_recurgs_native.tsdf import TSDFVoxelMap, interleave_bits_3d, deinterleave_bits_3d
-from vg_mapping_recurgs_native.vdc import VariationAwareDensityController, compute_ssim_map
-from vg_mapping_recurgs_native.recurgs_se3 import exp_se3, exp_so3, icp_coarse_alignment, RecurGSLieAlgebraAligner
-from vg_mapping_recurgs_native.pipeline import NativeVGMappingRecurGSPipeline
+from vgmapping_drema.tsdf import TSDFVoxelMap, interleave_bits_3d, deinterleave_bits_3d
+from vgmapping_drema.vdc import VariationAwareDensityController, compute_ssim_map
+from vgmapping_drema.recurgs_se3 import exp_se3, exp_so3, icp_coarse_alignment, RecurGSLieAlgebraAligner
+from vgmapping_drema.pipeline import NativeVGMappingRecurGSPipeline
 
 def test_morton_encoding():
     print("--- Test 1: Morton Code Encoding/Decoding ---")
