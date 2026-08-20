@@ -221,8 +221,8 @@ class VariationAwareDensityController:
         n_norm = n / (torch.norm(n, dim=-1, keepdim=True) + 1e-6)
 
         L = patch_sizes_init.unsqueeze(-1) / 2.0
-        d_scale = (L * d_vals_init.unsqueeze(-1)) / fx
-        S_diag = d_scale * n_norm
+        d_scale = (L * d_vals_init.unsqueeze(-1)) / torch.abs(fx)
+        S_diag = torch.abs(d_scale * n_norm)
 
         rgb_vals = rgb_obs[:, v_init, u_init].T # (N_init, 3)
         morton_vals = tsdf_map.point_to_morton(p_world_init) # (N_init,)
