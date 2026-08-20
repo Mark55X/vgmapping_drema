@@ -107,6 +107,9 @@ def quadtree_segmentation_vectorized(
     all_sz = torch.cat(sz_leaves)
     return all_u, all_v, all_sz
 
+# Backward compatibility alias
+quadtree_segmentation = quadtree_segmentation_vectorized
+
 
 class VariationAwareDensityController:
     """
@@ -206,11 +209,18 @@ class VariationAwareDensityController:
         p_cam = torch.stack([x_cam, y_cam, d_vals], dim=-1) # (N, 3)
         p_world = p_cam @ R_c2w.T + t_c2w # (N, 3)
 
+        # # Filter to robot workspace table ROI (ignores floor z<0.68, distant walls, background)
+        # in_workspace = (
+        #     (p_world[:, 0] >= -0.30) & (p_world[:, 0] <= 0.85) &
+        #     (p_world[:, 1] >= -0.65) & (p_world[:, 1] <= 0.65) &
+        #     (p_world[:, 2] >= 0.68)  & (p_world[:, 2] <= 1.50)
+        # )
+
         # 2. Geometry-based Variation Detection (GVD) in batch
         _, w_vals = tsdf_map.query_tsdf_and_weight(p_world)
         gvd_flag = w_vals <= 1.0
 
-        init_mask = avd_flag | gvd_flag
+        init_mask = (avd_flag | gvd_flag) # & in_workspace
         if not torch.any(init_mask):
             return {
                 'xyz': torch.empty((0, 3), device=self.device),
