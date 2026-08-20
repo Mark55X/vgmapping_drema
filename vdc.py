@@ -44,7 +44,7 @@ class QuadtreeNode:
         self.children: List['QuadtreeNode'] = []
         self.is_leaf = True
 
-def quadtree_segmentation(img: torch.Tensor, min_size: int = 4, max_size: int = 32, threshold: float = 0.02) -> List[QuadtreeNode]:
+def quadtree_segmentation(img: torch.Tensor, min_size: int = 4, max_size: int = 12, threshold: float = 0.005) -> List[QuadtreeNode]:
     """
     Quadtree image segmentation based on MSE variance.
     Returns leaf nodes corresponding to square image patches.
@@ -100,16 +100,14 @@ class VariationAwareDensityController:
     """
     def __init__(
         self,
-        ssim_threshold: float = 0.6,   # tau_s
-        prune_threshold: float = 0.2,  # tau_p
-        keyframe_threshold: int = 200, # tau_k
-        min_ray_dist: float = 0.1,     # n_p
+        tau_s: float = 0.6,
+        tau_p: float = 0.2,
+        near_plane: float = 0.1,
         device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ):
-        self.tau_s = ssim_threshold
-        self.tau_p = prune_threshold
-        self.tau_k = keyframe_threshold
-        self.n_p = min_ray_dist
+        self.tau_s = tau_s
+        self.tau_p = tau_p
+        self.n_p = near_plane
         self.device = device
 
     def detect_and_initialize_gaussians(
@@ -126,7 +124,7 @@ class VariationAwareDensityController:
         """
         Runs vectorized AVD and GVD passes over quadtree image patches to initialize new Gaussian primitives.
         """
-        leaves = quadtree_segmentation(rgb_obs, min_size=4, max_size=32)
+        leaves = quadtree_segmentation(rgb_obs, min_size=4, max_size=12, threshold=0.005)
         if len(leaves) == 0:
             return {
                 'xyz': torch.empty((0, 3), device=self.device),
