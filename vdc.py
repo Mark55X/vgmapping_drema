@@ -288,11 +288,11 @@ class VariationAwareDensityController:
         R_c2w = pose[:3, :3].to(self.device)
         t_c2w = pose[:3, 3].to(self.device)
 
-        # Batch Ray Sampling with safety margin to prevent pruning valid surface geometry
-        num_steps = 40
+        # Batch Ray Sampling: rays from near plane to current observed depth minus 1.5cm margin
+        num_steps = 30
         step_fractions = torch.linspace(0.0, 1.0, num_steps, device=self.device).view(1, -1) # (1, S)
         z_start = self.n_p
-        safety_margin = max(0.035, 3.5 * s)
+        safety_margin = max(0.015, 1.5 * s)
         z_end = torch.clamp(depth_vals - safety_margin, min=self.n_p).unsqueeze(1) # (R, 1)
         z_samples = z_start + step_fractions * (z_end - z_start) # (R, S)
 
@@ -306,14 +306,8 @@ class VariationAwareDensityController:
         p_cam_flat = p_cam.reshape(-1, 3) # (R*S, 3)
         p_w_flat = p_cam_flat @ R_c2w.T + t_c2w # (R*S, 3)
 
-        f_vals, w_vals = tsdf_map.query_tsdf_and_weight(p_w_flat)
-
-        prune_condition = (w_vals > 0) & ((f_vals < self.tau_p) | (f_vals > 0.95))
-        if not torch.any(prune_condition):
-            return torch.zeros(len(gaussian_morton_codes), dtype=torch.bool, device=self.device)
-
-        bad_points = p_w_flat[prune_condition]
-        bad_mortons = tsdf_map.point_to_morton(bad_points).unique()
+        # All voxels in front of the observed surface are free space
+        bad_mortons = tsdf_map.point_to_morton(p_w_flat).unique()
 
         prune_mask = torch.isin(gaussian_morton_codes, bad_mortons)
         return prune_mask
