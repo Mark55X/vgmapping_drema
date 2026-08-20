@@ -36,56 +36,76 @@ def compute_ssim_map(img1: torch.Tensor, img2: torch.Tensor, window_size: int = 
     return ssim_map.mean(dim=1, keepdim=True) # (1, 1, H, W)
 
 
-class QuadtreeNode:
-    def __init__(self, x: int, y: int, size: int):
-        self.x = x
-        self.y = y
-        self.size = size
-        self.children: List['QuadtreeNode'] = []
-        self.is_leaf = True
-
-def quadtree_segmentation(img: torch.Tensor, min_size: int = 4, max_size: int = 12, threshold: float = 0.005) -> List[QuadtreeNode]:
+def quadtree_segmentation_vectorized(
+    img: torch.Tensor,
+    min_size: int = 4,
+    max_size: int = 16,
+    threshold: float = 0.005
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Quadtree image segmentation based on MSE variance.
-    Returns leaf nodes corresponding to square image patches.
+    Vectorized GPU Quadtree segmentation using fast avg_pool2d variance maps.
+    Returns (u_c, v_c, patch_sizes) directly on GPU without Python recursion or GPU-CPU sync stalls.
     """
-    _, H, W = img.shape
     device = img.device
-    leaves = []
+    C, H, W = img.shape
+    img_4d = img.unsqueeze(0)
+    img_sq_4d = img_4d.pow(2)
 
-    def build_tree(x: int, y: int, size: int):
-        node = QuadtreeNode(x, y, size)
-        if size <= min_size:
-            leaves.append(node)
-            return node
+    # 1. Level 1: max_size blocks (e.g. 16x16)
+    mean_max = F.avg_pool2d(img_4d, max_size, stride=max_size)
+    sq_mean_max = F.avg_pool2d(img_sq_4d, max_size, stride=max_size)
+    var_max = (sq_mean_max - mean_max.pow(2)).mean(dim=1).squeeze(0)
 
-        patch = img[:, y:y+size, x:x+size]
-        if patch.numel() == 0:
-            return node
+    leaf_mask_max = (var_max < threshold)
 
-        mse = torch.var(patch, dim=(1, 2)).mean().item()
-        if mse < threshold or size // 2 < min_size:
-            leaves.append(node)
-            return node
+    v_m, u_m = torch.where(leaf_mask_max)
+    u_leaves = [u_m * max_size + max_size // 2]
+    v_leaves = [v_m * max_size + max_size // 2]
+    sz_leaves = [torch.full_like(u_m, max_size, dtype=torch.float32)]
 
-        node.is_leaf = False
-        half = size // 2
-        for dy in [0, half]:
-            for dx in [0, half]:
-                if x + dx < W and y + dy < H:
-                    child = build_tree(x + dx, y + dy, half)
-                    node.children.append(child)
-        return node
+    # 2. Level 2: Sub-blocks needing split (e.g. 8x8)
+    split_v, split_u = torch.where(~leaf_mask_max)
+    if len(split_v) > 0:
+        half_sz = max_size // 2
+        mean_half = F.avg_pool2d(img_4d, half_sz, stride=half_sz)
+        sq_mean_half = F.avg_pool2d(img_sq_4d, half_sz, stride=half_sz)
+        var_half = (sq_mean_half - mean_half.pow(2)).mean(dim=1).squeeze(0)
 
-    for y in range(0, H, max_size):
-        for x in range(0, W, max_size):
-            h_s = min(max_size, H - y)
-            w_s = min(max_size, W - x)
-            sz = min(h_s, w_s)
-            if sz >= min_size:
-                build_tree(x, y, sz)
+        sub_v = torch.stack([split_v * 2, split_v * 2, split_v * 2 + 1, split_v * 2 + 1], dim=1).flatten()
+        sub_u = torch.stack([split_u * 2, split_u * 2 + 1, split_u * 2, split_u * 2 + 1], dim=1).flatten()
 
-    return leaves
+        valid_sub = (sub_v < var_half.shape[0]) & (sub_u < var_half.shape[1])
+        sub_v = sub_v[valid_sub]
+        sub_u = sub_u[valid_sub]
+
+        var_sub = var_half[sub_v, sub_u]
+        leaf_mask_sub = (var_sub < threshold) | (half_sz <= min_size)
+
+        u_leaves.append(sub_u[leaf_mask_sub] * half_sz + half_sz // 2)
+        v_leaves.append(sub_v[leaf_mask_sub] * half_sz + half_sz // 2)
+        sz_leaves.append(torch.full((leaf_mask_sub.sum(),), half_sz, dtype=torch.float32, device=device))
+
+        # 3. Level 3: Fine sub-blocks (e.g. 4x4)
+        if half_sz > min_size:
+            q_sz = half_sz // 2
+            split_sub_v = sub_v[~leaf_mask_sub]
+            split_sub_u = sub_u[~leaf_mask_sub]
+            if len(split_sub_v) > 0:
+                q_v = torch.stack([split_sub_v * 2, split_sub_v * 2, split_sub_v * 2 + 1, split_sub_v * 2 + 1], dim=1).flatten()
+                q_u = torch.stack([split_sub_u * 2, split_sub_u * 2 + 1, split_sub_u * 2, split_sub_u * 2 + 1], dim=1).flatten()
+                mean_q = F.avg_pool2d(img_4d, q_sz, stride=q_sz)
+                valid_q = (q_v < mean_q.shape[2]) & (q_u < mean_q.shape[3])
+                q_v = q_v[valid_q]
+                q_u = q_u[valid_q]
+
+                u_leaves.append(q_u * q_sz + q_sz // 2)
+                v_leaves.append(q_v * q_sz + q_sz // 2)
+                sz_leaves.append(torch.full((len(q_u),), q_sz, dtype=torch.float32, device=device))
+
+    all_u = torch.cat(u_leaves)
+    all_v = torch.cat(v_leaves)
+    all_sz = torch.cat(sz_leaves)
+    return all_u, all_v, all_sz
 
 
 class VariationAwareDensityController:
@@ -124,8 +144,8 @@ class VariationAwareDensityController:
         """
         Runs vectorized AVD and GVD passes over quadtree image patches to initialize new Gaussian primitives.
         """
-        leaves = quadtree_segmentation(rgb_obs, min_size=4, max_size=12, threshold=0.005)
-        if len(leaves) == 0:
+        u_c, v_c, patch_sizes = quadtree_segmentation_vectorized(rgb_obs, min_size=4, max_size=16, threshold=0.005)
+        if len(u_c) == 0:
             return {
                 'xyz': torch.empty((0, 3), device=self.device),
                 'rgb': torch.empty((0, 3), device=self.device),
@@ -144,11 +164,6 @@ class VariationAwareDensityController:
 
         R_c2w = pose[:3, :3].to(self.device)
         t_c2w = pose[:3, 3].to(self.device)
-
-        # Vectorize patch properties
-        u_c = torch.tensor([p.x + p.size // 2 for p in leaves], dtype=torch.long, device=self.device)
-        v_c = torch.tensor([p.y + p.size // 2 for p in leaves], dtype=torch.long, device=self.device)
-        patch_sizes = torch.tensor([p.size for p in leaves], dtype=torch.float32, device=self.device)
 
         valid_bounds = (u_c < W) & (v_c < H)
         u_c = u_c[valid_bounds]
@@ -256,7 +271,7 @@ class VariationAwareDensityController:
         pose: torch.Tensor,
         tsdf_map: TSDFVoxelMap,
         gaussian_morton_codes: torch.Tensor,
-        stride: int = 8
+        stride: int = 12
     ) -> torch.Tensor:
         """
         Vectorized frustum ray-casting (Eq. 17) in GPU batch.
@@ -292,7 +307,7 @@ class VariationAwareDensityController:
         t_c2w = pose[:3, 3].to(self.device)
 
         # Batch Ray Sampling: rays from near plane to current observed depth minus 1.5cm margin
-        num_steps = 30
+        num_steps = 20
         step_fractions = torch.linspace(0.0, 1.0, num_steps, device=self.device).view(1, -1) # (1, S)
         z_start = self.n_p
         safety_margin = max(0.015, 1.5 * s)
