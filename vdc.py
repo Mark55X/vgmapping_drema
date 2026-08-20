@@ -217,12 +217,17 @@ class VariationAwareDensityController:
         grad_s = tsdf_map.compute_surface_normal(p_world_init) # (N_init, 3)
         grad_norm = torch.norm(grad_s, dim=-1, keepdim=True)
         
+        # Exact Equations (15) and (16) from VG-Mapping paper (arXiv:2510.09962)
+        L = patch_sizes_init.unsqueeze(-1) / 2.0
+        d = (L * d_vals_init.unsqueeze(-1)) / torch.abs(fx)
+
+        # n = 1_3 ⊘ (1_3 + abs(∇S(pc)))
         n = torch.where(grad_norm > 1e-5, 1.0 / (1.0 + torch.abs(grad_s)), torch.ones_like(grad_s))
         n_norm = n / (torch.norm(n, dim=-1, keepdim=True) + 1e-6)
 
-        L = patch_sizes_init.unsqueeze(-1) / 2.0
-        d_scale = (L * d_vals_init.unsqueeze(-1)) / torch.abs(fx)
-        S_diag = torch.abs(d_scale * n_norm)
+        # S = d · diag(n / ||n||_2)
+        S_diag = d * n_norm
+        S_diag = torch.clamp(S_diag, min=1e-4)
 
         rgb_vals = rgb_obs[:, v_init, u_init].T # (N_init, 3)
         morton_vals = tsdf_map.point_to_morton(p_world_init) # (N_init,)
