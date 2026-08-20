@@ -288,11 +288,12 @@ class VariationAwareDensityController:
         R_c2w = pose[:3, :3].to(self.device)
         t_c2w = pose[:3, 3].to(self.device)
 
-        # Batch Ray Sampling
+        # Batch Ray Sampling with safety margin to prevent pruning valid surface geometry
         num_steps = 40
         step_fractions = torch.linspace(0.0, 1.0, num_steps, device=self.device).view(1, -1) # (1, S)
         z_start = self.n_p
-        z_end = torch.clamp(depth_vals - s, min=self.n_p).unsqueeze(1) # (R, 1)
+        safety_margin = max(0.035, 3.5 * s)
+        z_end = torch.clamp(depth_vals - safety_margin, min=self.n_p).unsqueeze(1) # (R, 1)
         z_samples = z_start + step_fractions * (z_end - z_start) # (R, S)
 
         u_exp = grid_u.unsqueeze(1).expand(-1, num_steps) # (R, S)
@@ -305,9 +306,9 @@ class VariationAwareDensityController:
         p_cam_flat = p_cam.reshape(-1, 3) # (R*S, 3)
         p_w_flat = p_cam_flat @ R_c2w.T + t_c2w # (R*S, 3)
 
-        f_vals, _ = tsdf_map.query_tsdf_and_weight(p_w_flat)
+        f_vals, w_vals = tsdf_map.query_tsdf_and_weight(p_w_flat)
 
-        prune_condition = (f_vals < self.tau_p) | (f_vals > 0.95)
+        prune_condition = (w_vals > 0) & ((f_vals < self.tau_p) | (f_vals > 0.95))
         if not torch.any(prune_condition):
             return torch.zeros(len(gaussian_morton_codes), dtype=torch.bool, device=self.device)
 
