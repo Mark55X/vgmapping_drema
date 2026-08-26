@@ -38,9 +38,9 @@ def compute_ssim_map(img1: torch.Tensor, img2: torch.Tensor, window_size: int = 
 
 def quadtree_segmentation_vectorized(
     img: torch.Tensor,
-    min_size: int = 2,
-    max_size: int = 8,
-    threshold: float = 0.002
+    min_size: int = 4,
+    max_size: int = 16,
+    threshold: float = 0.003
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Vectorized GPU Quadtree segmentation using fast avg_pool2d variance maps.
@@ -51,7 +51,7 @@ def quadtree_segmentation_vectorized(
     img_4d = img.unsqueeze(0)
     img_sq_4d = img_4d.pow(2)
 
-    # 1. Level 1: max_size blocks (e.g. 8x8)
+    # 1. Level 1: max_size blocks (e.g. 16x16)
     mean_max = F.avg_pool2d(img_4d, max_size, stride=max_size)
     sq_mean_max = F.avg_pool2d(img_sq_4d, max_size, stride=max_size)
     var_max = (sq_mean_max - mean_max.pow(2)).mean(dim=1).squeeze(0)
@@ -63,7 +63,7 @@ def quadtree_segmentation_vectorized(
     v_leaves = [v_m * max_size + max_size // 2]
     sz_leaves = [torch.full_like(u_m, max_size, dtype=torch.float32)]
 
-    # 2. Level 2: Sub-blocks needing split (e.g. 4x4)
+    # 2. Level 2: Sub-blocks needing split (e.g. 8x8)
     split_v, split_u = torch.where(~leaf_mask_max)
     if len(split_v) > 0:
         half_sz = max_size // 2
@@ -85,7 +85,7 @@ def quadtree_segmentation_vectorized(
         v_leaves.append(sub_v[leaf_mask_sub] * half_sz + half_sz // 2)
         sz_leaves.append(torch.full((leaf_mask_sub.sum(),), half_sz, dtype=torch.float32, device=device))
 
-        # 3. Level 3: Fine sub-blocks (e.g. 2x2)
+        # 3. Level 3: Fine sub-blocks (e.g. 4x4)
         if half_sz > min_size:
             q_sz = half_sz // 2
             split_sub_v = sub_v[~leaf_mask_sub]
@@ -151,7 +151,7 @@ class VariationAwareDensityController:
         """
         Runs vectorized AVD and GVD passes over quadtree image patches to initialize new Gaussian primitives.
         """
-        u_c, v_c, patch_sizes = quadtree_segmentation_vectorized(rgb_obs, min_size=2, max_size=8, threshold=0.002)
+        u_c, v_c, patch_sizes = quadtree_segmentation_vectorized(rgb_obs, min_size=4, max_size=16, threshold=0.003)
         if len(u_c) == 0:
             return {
                 'xyz': torch.empty((0, 3), device=self.device),
@@ -252,31 +252,28 @@ class VariationAwareDensityController:
 
         # Compute surface normals in batch
         grad_s = tsdf_map.compute_surface_normal(p_world_init) # (N_init, 3)
-        grad_norm = torch.norm(grad_s, dim=-1, keepdim=True)
-        
-        # Exact Equations (15) and (16) from VG-Mapping paper (arXiv:2510.09962)
-        L = patch_sizes_init.unsqueeze(-1) / 2.0
-        d = (L * d_vals_init.unsqueeze(-1)) / torch.abs(fx)
+        norm_grad = torch.norm(grad_s, dim=-1, keepdim=True) + 1e-8
+        normals = grad_s / norm_grad # (N_init, 3)
 
-        # n = 1_3 ⊘ (1_3 + abs(∇S(pc)))
-        n = torch.where(grad_norm > 1e-5, 1.0 / (1.0 + torch.abs(grad_s)), torch.ones_like(grad_s))
-        n_norm = n / (torch.norm(n, dim=-1, keepdim=True) + 1e-6)
+        # Eq. (16): Anisotropic Gaussian scaling S = diag(s_major, s_minor, s_minor)
+        s = tsdf_map.voxel_size
+        s_major = (patch_sizes_init.float() / fx) * d_vals_init
+        s_minor = torch.full_like(s_major, s * 0.5)
 
-        # S = d · diag(n / ||n||_2)
-        S_diag = d * n_norm
+        S_diag = torch.stack([s_major, s_minor, s_minor], dim=-1)
         S_diag = torch.clamp(S_diag, min=1e-4)
 
+        # Sample RGB color
         rgb_vals = rgb_obs[:, v_init, u_init].T # (N_init, 3)
-        morton_vals = tsdf_map.point_to_morton(p_world_init) # (N_init,)
 
+        # Assign Morton code in batch
+        morton_vals = tsdf_map.point_to_morton(p_world_init)
+
+        # Assign semantic Object ID if mask is provided
         if mask_obs is not None:
-            if mask_obs.ndim == 3:
-                mask_obs = mask_obs[:, :, 0]
-            obj_id_vals = mask_obs[v_init, u_init].to(torch.int32).squeeze()
-            if obj_id_vals.ndim > 1:
-                obj_id_vals = obj_id_vals[:, 0]
-            elif obj_id_vals.ndim == 0:
-                obj_id_vals = obj_id_vals.unsqueeze(0)
+            if mask_obs.dim() == 3:
+                mask_obs = mask_obs.squeeze(0)
+            obj_id_vals = mask_obs[v_init, u_init].to(dtype=torch.int32, device=self.device)
         else:
             obj_id_vals = torch.zeros(len(p_world_init), dtype=torch.int32, device=self.device)
 
@@ -354,7 +351,19 @@ class VariationAwareDensityController:
             return torch.zeros(len(gaussian_morton_codes), dtype=torch.bool, device=self.device)
 
         p_w_valid_rays = p_w_flat[inside_rays]
-        bad_mortons = tsdf_map.point_to_morton(p_w_valid_rays).unique()
+
+        # TSDF Surface Consistency Check:
+        # A ray sample is only considered true free space if F > 0.15 or unobserved (W <= 1.0).
+        # Confirmed solid surfaces (|F| <= 0.15 with W > 1.0) observed by ANY camera are PROTECTED
+        # from cross-view raycast over-pruning.
+        F_ray_vals, W_ray_vals = tsdf_map.query_tsdf_and_weight(p_w_valid_rays)
+        free_space_mask = (F_ray_vals > 0.15) | (W_ray_vals <= 1.0)
+        p_w_free_rays = p_w_valid_rays[free_space_mask]
+
+        if len(p_w_free_rays) == 0:
+            return torch.zeros(len(gaussian_morton_codes), dtype=torch.bool, device=self.device)
+
+        bad_mortons = tsdf_map.point_to_morton(p_w_free_rays).unique()
         bad_mortons = bad_mortons[bad_mortons >= 0] # exclude invalid sentinel -1
 
         prune_mask = torch.zeros(len(gaussian_morton_codes), dtype=torch.bool, device=self.device)
