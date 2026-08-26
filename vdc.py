@@ -142,7 +142,9 @@ class VariationAwareDensityController:
         intrinsic: torch.Tensor,
         pose: torch.Tensor,
         tsdf_map: TSDFVoxelMap,
-        mask_obs: Optional[torch.Tensor] = None
+        mask_obs: Optional[torch.Tensor] = None,
+        workspace_bounds: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        is_initial_timestep: bool = False
     ) -> Dict[str, torch.Tensor]:
         """
         Runs vectorized AVD and GVD passes over quadtree image patches to initialize new Gaussian primitives.
@@ -209,18 +211,26 @@ class VariationAwareDensityController:
         p_cam = torch.stack([x_cam, y_cam, d_vals], dim=-1) # (N, 3)
         p_world = p_cam @ R_c2w.T + t_c2w # (N, 3)
 
-        # # Filter to robot workspace table ROI (ignores floor z<0.68, distant walls, background)
-        # in_workspace = (
-        #     (p_world[:, 0] >= -0.30) & (p_world[:, 0] <= 0.85) &
-        #     (p_world[:, 1] >= -0.65) & (p_world[:, 1] <= 0.65) &
-        #     (p_world[:, 2] >= 0.68)  & (p_world[:, 2] <= 1.50)
-        # )
+        # Filter to robot workspace table ROI
+        if workspace_bounds is not None:
+            min_b, max_b = workspace_bounds
+            in_workspace = (
+                (p_world[:, 0] >= min_b[0]) & (p_world[:, 0] <= max_b[0]) &
+                (p_world[:, 1] >= min_b[1]) & (p_world[:, 1] <= max_b[1]) &
+                (p_world[:, 2] >= min_b[2]) & (p_world[:, 2] <= max_b[2])
+            )
+        else:
+            in_workspace = tsdf_map.is_inside_grid(p_world)
 
         # 2. Geometry-based Variation Detection (GVD) in batch
         _, w_vals = tsdf_map.query_tsdf_and_weight(p_world)
         gvd_flag = w_vals <= 1.0
 
-        init_mask = (avd_flag | gvd_flag) # & in_workspace
+        if is_initial_timestep:
+            init_mask = in_workspace
+        else:
+            init_mask = in_workspace & (avd_flag | gvd_flag)
+
         if not torch.any(init_mask):
             return {
                 'xyz': torch.empty((0, 3), device=self.device),
@@ -334,8 +344,18 @@ class VariationAwareDensityController:
         p_cam_flat = p_cam.reshape(-1, 3) # (R*S, 3)
         p_w_flat = p_cam_flat @ R_c2w.T + t_c2w # (R*S, 3)
 
-        # All voxels in front of the observed surface are free space
-        bad_mortons = tsdf_map.point_to_morton(p_w_flat).unique()
+        # Only ray samples strictly inside the TSDF grid boundary are evaluated
+        inside_rays = tsdf_map.is_inside_grid(p_w_flat)
+        if not torch.any(inside_rays):
+            return torch.zeros(len(gaussian_morton_codes), dtype=torch.bool, device=self.device)
 
-        prune_mask = torch.isin(gaussian_morton_codes, bad_mortons)
+        p_w_valid_rays = p_w_flat[inside_rays]
+        bad_mortons = tsdf_map.point_to_morton(p_w_valid_rays).unique()
+        bad_mortons = bad_mortons[bad_mortons >= 0] # exclude invalid sentinel -1
+
+        prune_mask = torch.zeros(len(gaussian_morton_codes), dtype=torch.bool, device=self.device)
+        valid_g_mask = (gaussian_morton_codes >= 0)
+        if len(bad_mortons) > 0 and torch.any(valid_g_mask):
+            prune_mask[valid_g_mask] = torch.isin(gaussian_morton_codes[valid_g_mask], bad_mortons)
+
         return prune_mask

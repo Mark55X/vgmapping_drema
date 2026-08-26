@@ -80,6 +80,16 @@ class TSDFVoxelMap:
         # Precompute Morton codes for all voxels
         self.morton_codes = interleave_bits_3d(grid_x, grid_y, grid_z) # (nx, ny, nz)
 
+    def is_inside_grid(self, points: torch.Tensor) -> torch.Tensor:
+        """
+        Returns boolean mask (N,) of points strictly inside voxel grid bounding box.
+        """
+        if len(points) == 0:
+            return torch.zeros(0, dtype=torch.bool, device=self.device)
+        max_bound = self.origin + torch.tensor(self.grid_dim, dtype=torch.float32, device=self.device) * self.voxel_size
+        inside = (points >= self.origin) & (points < max_bound)
+        return inside.all(dim=-1)
+
     def point_to_voxel_index(self, points: torch.Tensor) -> torch.Tensor:
         """
         Converts 3D world points (N, 3) into voxel grid integer indices (N, 3).
@@ -91,10 +101,15 @@ class TSDFVoxelMap:
 
     def point_to_morton(self, points: torch.Tensor) -> torch.Tensor:
         """
-        Computes Morton code V for 3D world points p.
+        Computes Morton code V for 3D world points p. Points outside the grid get -1.
         """
+        if len(points) == 0:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+        inside = self.is_inside_grid(points)
         indices = self.point_to_voxel_index(points)
-        return interleave_bits_3d(indices[:, 0], indices[:, 1], indices[:, 2])
+        morton = interleave_bits_3d(indices[:, 0], indices[:, 1], indices[:, 2])
+        morton = torch.where(inside, morton, torch.tensor(-1, dtype=torch.int64, device=self.device))
+        return morton
 
     def integrate_depth_frame(
         self,
@@ -235,12 +250,17 @@ class TSDFVoxelMap:
             return vertices, triangles
         except ImportError:
             # Fallback using skimage marching cubes
-            from skimage.measure import marching_cubes
-            F_np = self.F.cpu().numpy()
-            W_np = self.W.cpu().numpy()
-            F_np[W_np <= 0.5] = 1.0
-            
-            verts, faces, normals, values = marching_cubes(F_np, level=level)
-            origin_np = self.origin.cpu().numpy()
-            verts = origin_np + (verts + 0.5) * self.voxel_size
-            return verts, faces
+            try:
+                from skimage.measure import marching_cubes
+                F_np = self.F.cpu().numpy()
+                W_np = self.W.cpu().numpy()
+                F_np[W_np <= 0.5] = 1.0
+                if F_np.min() > level or F_np.max() < level:
+                    return np.empty((0, 3)), np.empty((0, 3), dtype=np.int32)
+                
+                verts, faces, normals, values = marching_cubes(F_np, level=level)
+                origin_np = self.origin.cpu().numpy()
+                verts = origin_np + (verts + 0.5) * self.voxel_size
+                return verts, faces
+            except Exception:
+                return np.empty((0, 3)), np.empty((0, 3), dtype=np.int32)
