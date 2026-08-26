@@ -38,9 +38,9 @@ def compute_ssim_map(img1: torch.Tensor, img2: torch.Tensor, window_size: int = 
 
 def quadtree_segmentation_vectorized(
     img: torch.Tensor,
-    min_size: int = 4,
-    max_size: int = 16,
-    threshold: float = 0.005
+    min_size: int = 2,
+    max_size: int = 8,
+    threshold: float = 0.002
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Vectorized GPU Quadtree segmentation using fast avg_pool2d variance maps.
@@ -51,7 +51,7 @@ def quadtree_segmentation_vectorized(
     img_4d = img.unsqueeze(0)
     img_sq_4d = img_4d.pow(2)
 
-    # 1. Level 1: max_size blocks (e.g. 16x16)
+    # 1. Level 1: max_size blocks (e.g. 8x8)
     mean_max = F.avg_pool2d(img_4d, max_size, stride=max_size)
     sq_mean_max = F.avg_pool2d(img_sq_4d, max_size, stride=max_size)
     var_max = (sq_mean_max - mean_max.pow(2)).mean(dim=1).squeeze(0)
@@ -63,7 +63,7 @@ def quadtree_segmentation_vectorized(
     v_leaves = [v_m * max_size + max_size // 2]
     sz_leaves = [torch.full_like(u_m, max_size, dtype=torch.float32)]
 
-    # 2. Level 2: Sub-blocks needing split (e.g. 8x8)
+    # 2. Level 2: Sub-blocks needing split (e.g. 4x4)
     split_v, split_u = torch.where(~leaf_mask_max)
     if len(split_v) > 0:
         half_sz = max_size // 2
@@ -85,7 +85,7 @@ def quadtree_segmentation_vectorized(
         v_leaves.append(sub_v[leaf_mask_sub] * half_sz + half_sz // 2)
         sz_leaves.append(torch.full((leaf_mask_sub.sum(),), half_sz, dtype=torch.float32, device=device))
 
-        # 3. Level 3: Fine sub-blocks (e.g. 4x4)
+        # 3. Level 3: Fine sub-blocks (e.g. 2x2)
         if half_sz > min_size:
             q_sz = half_sz // 2
             split_sub_v = sub_v[~leaf_mask_sub]
@@ -144,12 +144,14 @@ class VariationAwareDensityController:
         tsdf_map: TSDFVoxelMap,
         mask_obs: Optional[torch.Tensor] = None,
         workspace_bounds: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        is_initial_timestep: bool = False
+        is_initial_timestep: bool = False,
+        num_views: int = 1,
+        tau_w: Optional[float] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Runs vectorized AVD and GVD passes over quadtree image patches to initialize new Gaussian primitives.
         """
-        u_c, v_c, patch_sizes = quadtree_segmentation_vectorized(rgb_obs, min_size=4, max_size=16, threshold=0.005)
+        u_c, v_c, patch_sizes = quadtree_segmentation_vectorized(rgb_obs, min_size=2, max_size=8, threshold=0.002)
         if len(u_c) == 0:
             return {
                 'xyz': torch.empty((0, 3), device=self.device),
@@ -223,8 +225,10 @@ class VariationAwareDensityController:
             in_workspace = tsdf_map.is_inside_grid(p_world)
 
         # 2. Geometry-based Variation Detection (GVD) in batch
+        # Dynamic threshold tau_w is proportional to the number of active camera views in the timestep
+        effective_tau_w = float(num_views) if tau_w is None else tau_w
         _, w_vals = tsdf_map.query_tsdf_and_weight(p_world)
-        gvd_flag = w_vals <= 1.0
+        gvd_flag = w_vals <= effective_tau_w
 
         if is_initial_timestep:
             init_mask = in_workspace
