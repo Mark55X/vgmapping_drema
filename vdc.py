@@ -146,7 +146,9 @@ class VariationAwareDensityController:
         workspace_bounds: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         is_initial_timestep: bool = False,
         num_views: int = 1,
-        tau_w: Optional[float] = None
+        tau_w: Optional[float] = None,
+        robot_ids: Optional[Set[int]] = None,
+        target_object_ids: Optional[Set[int]] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Runs vectorized AVD and GVD passes over quadtree image patches to initialize new Gaussian primitives.
@@ -203,6 +205,24 @@ class VariationAwareDensityController:
                 'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device)
             }
 
+        # Sample semantic mask IDs for patches
+        is_robot = torch.zeros(len(u_c), dtype=torch.bool, device=self.device)
+        is_dynamic_obj = torch.zeros(len(u_c), dtype=torch.bool, device=self.device)
+        if mask_obs is not None:
+            if mask_obs.dim() == 3:
+                mask_obs = mask_obs.squeeze(0)
+            sampled_mask_ids = mask_obs[v_c, u_c]
+            
+            # Filter out robot arm links (PyBullet manages robot kinematics)
+            if robot_ids is not None and len(robot_ids) > 0:
+                r_tensor = torch.tensor(list(robot_ids), device=self.device, dtype=sampled_mask_ids.dtype)
+                is_robot = torch.isin(sampled_mask_ids, r_tensor)
+            
+            # Identify target dynamic objects
+            if target_object_ids is not None and len(target_object_ids) > 0:
+                t_tensor = torch.tensor(list(target_object_ids), device=self.device, dtype=sampled_mask_ids.dtype)
+                is_dynamic_obj = torch.isin(sampled_mask_ids, t_tensor)
+
         # 1. Appearance-based Variation Detection (AVD)
         patch_ssim = ssim_map[v_c, u_c]
         avd_flag = patch_ssim < self.tau_s
@@ -225,15 +245,15 @@ class VariationAwareDensityController:
             in_workspace = tsdf_map.is_inside_grid(p_world)
 
         # 2. Geometry-based Variation Detection (GVD) in batch
-        # Dynamic threshold tau_w is proportional to the number of active camera views in the timestep
         effective_tau_w = float(num_views) if tau_w is None else tau_w
         _, w_vals = tsdf_map.query_tsdf_and_weight(p_world)
         gvd_flag = w_vals <= effective_tau_w
 
+        # In pure VG-Mapping, moving objects and newly appeared surfaces are fully initialized
         if is_initial_timestep:
-            init_mask = in_workspace
+            init_mask = in_workspace & (~is_robot)
         else:
-            init_mask = in_workspace & (avd_flag | gvd_flag)
+            init_mask = in_workspace & (~is_robot) & (is_dynamic_obj | avd_flag | gvd_flag)
 
         if not torch.any(init_mask):
             return {
