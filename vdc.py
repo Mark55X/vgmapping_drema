@@ -313,7 +313,7 @@ class VariationAwareDensityController:
         tsdf_map: TSDFVoxelMap,
         gaussian_morton_codes: torch.Tensor,
         stride: int = 2,
-        num_steps: int = 256
+        num_steps: Optional[int] = None
     ) -> torch.Tensor:
         """
         Vectorized frustum ray-casting (Eq. 17) in GPU batch.
@@ -348,15 +348,28 @@ class VariationAwareDensityController:
         R_c2w = pose[:3, :3].to(self.device)
         t_c2w = pose[:3, 3].to(self.device)
 
-        # Batch Ray Sampling: dense rays from near plane to current observed depth minus margin
-        step_fractions = torch.linspace(0.0, 1.0, num_steps, device=self.device).view(1, -1) # (1, S)
-        z_start = self.n_p
+        # Smart workspace ray sampling:
+        # Dynamically compute the active ray window from the TSDF bounding box dimensions.
+        # Sample with sub-voxel resolution (0.5 * voxel_size) along the active optical path.
+        max_tsdf_extent = float(max(tsdf_map.grid_dim) * s)
+        window_len = max(0.40, min(1.0, max_tsdf_extent * 0.707))
+
         safety_margin = max(0.005, 0.5 * s)
         z_end = torch.clamp(depth_vals - safety_margin, min=self.n_p).unsqueeze(1) # (R, 1)
+        z_start = torch.clamp(z_end - window_len, min=self.n_p) # (R, 1)
+
+        # Theoretical optimal sub-voxel steps S = ceil(L_window / (0.5 * s))
+        if num_steps is not None and num_steps > 0:
+            actual_steps = num_steps
+        else:
+            actual_steps = int(np.ceil(window_len / (0.5 * s)))
+            actual_steps = max(32, min(180, actual_steps))
+
+        step_fractions = torch.linspace(0.0, 1.0, actual_steps, device=self.device).view(1, -1) # (1, S)
         z_samples = z_start + step_fractions * (z_end - z_start) # (R, S)
 
-        u_exp = grid_u.unsqueeze(1).expand(-1, num_steps) # (R, S)
-        v_exp = grid_v.unsqueeze(1).expand(-1, num_steps) # (R, S)
+        u_exp = grid_u.unsqueeze(1).expand(-1, actual_steps) # (R, S)
+        v_exp = grid_v.unsqueeze(1).expand(-1, actual_steps) # (R, S)
 
         x_cam = (u_exp.float() - cx) * z_samples / fx
         y_cam = (v_exp.float() - cy) * z_samples / fy
