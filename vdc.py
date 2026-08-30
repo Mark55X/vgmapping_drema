@@ -312,7 +312,8 @@ class VariationAwareDensityController:
         pose: torch.Tensor,
         tsdf_map: TSDFVoxelMap,
         gaussian_morton_codes: torch.Tensor,
-        stride: int = 4
+        stride: int = 2,
+        num_steps: int = 256
     ) -> torch.Tensor:
         """
         Vectorized frustum ray-casting (Eq. 17) in GPU batch.
@@ -348,10 +349,9 @@ class VariationAwareDensityController:
         t_c2w = pose[:3, 3].to(self.device)
 
         # Batch Ray Sampling: dense rays from near plane to current observed depth minus margin
-        num_steps = 64
         step_fractions = torch.linspace(0.0, 1.0, num_steps, device=self.device).view(1, -1) # (1, S)
         z_start = self.n_p
-        safety_margin = max(0.008, 0.8 * s)
+        safety_margin = max(0.005, 0.5 * s)
         z_end = torch.clamp(depth_vals - safety_margin, min=self.n_p).unsqueeze(1) # (R, 1)
         z_samples = z_start + step_fractions * (z_end - z_start) # (R, S)
 
