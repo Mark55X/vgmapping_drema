@@ -126,15 +126,16 @@ class NativeVGMappingRecurGSPipeline:
         # Coarse ICP
         T_coarse = icp_coarse_alignment(obj_gaussians_before['xyz'], obj_xyz_after)
 
-        # Fine Lie algebra optimization
+        # Fine Lie algebra optimization with 3D geometric + photometric alignment
         T_fine = self.se3_aligner.optimize_se3_pose(
             object_gaussians=obj_gaussians_before,
+            target_gaussians={'xyz': obj_xyz_after},
             gt_rgb=gt_rgb_after,
             gt_depth=gt_depth_after,
             intrinsic=intrinsic,
             camera_pose=pose,
             initial_T_coarse=T_coarse,
-            num_iterations=200
+            num_iterations=100
         )
 
         return T_fine

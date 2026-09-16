@@ -84,14 +84,15 @@ def test_recurgs_se3_alignment():
 
     T_fine = aligner.optimize_se3_pose(
         object_gaussians=obj_gaussians,
-        gt_rgb=gt_rgb,
-        gt_depth=gt_depth,
-        intrinsic=K,
-        camera_pose=pose,
+        target_gaussians={'xyz': tgt_pts},
         initial_T_coarse=T_coarse,
         num_iterations=50
     )
 
+    trans_err_fine = torch.norm(T_fine[:3, 3] - T_gt[:3, 3]).item()
+    rot_err_fine = torch.norm(T_fine[:3, :3] - T_gt[:3, :3]).item()
+    print(f"✓ RecurGS SE(3) fine alignment: trans err = {trans_err_fine:.5f} m, rot err = {rot_err_fine:.5f}")
+    assert trans_err_fine < 0.005, f"Translation error too high: {trans_err_fine}"
     print(f"✓ RecurGS SE(3) Lie algebra pose alignment completed. Estimated T_fine shape: {T_fine.shape}")
 
 def test_full_pipeline():
