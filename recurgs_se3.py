@@ -273,7 +273,8 @@ class RecurGSLieAlgebraAligner(nn.Module):
         camera_pose: Optional[torch.Tensor] = None,
         initial_T_coarse_dict: Optional[Dict[int, torch.Tensor]] = None,
         z_table: Optional[float] = None,
-        num_iterations: int = 50,
+        num_iterations: int = 15,
+        icp_max_iters: int = 12,
         lr: float = 3e-3,
         tol: float = 1e-5
     ) -> Dict[int, torch.Tensor]:
@@ -299,7 +300,7 @@ class RecurGSLieAlgebraAligner(nn.Module):
                 # Run robust ICP coarse alignment
                 src_pts = objects_source[oid]['xyz'].to(device)
                 tgt_pts = objects_target[oid]['xyz'].to(device)
-                T_icp = icp_coarse_alignment(src_pts, tgt_pts, max_iters=35, max_dist_thresh=0.15)
+                T_icp = icp_coarse_alignment(src_pts, tgt_pts, max_iters=icp_max_iters, max_dist_thresh=0.15)
                 initial_T_coarse[oid] = T_icp
             else:
                 initial_T_coarse[oid] = torch.eye(4, device=device)
