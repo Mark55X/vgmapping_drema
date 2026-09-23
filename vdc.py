@@ -260,6 +260,7 @@ class VariationAwareDensityController:
                 'xyz': torch.empty((0, 3), device=self.device),
                 'rgb': torch.empty((0, 3), device=self.device),
                 'scale': torch.empty((0, 3), device=self.device),
+                'normal': torch.empty((0, 3), device=self.device),
                 'morton': torch.empty((0,), dtype=torch.int64, device=self.device),
                 'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device)
             }
@@ -301,6 +302,7 @@ class VariationAwareDensityController:
             'xyz': p_world_init,
             'rgb': rgb_vals,
             'scale': S_diag,
+            'normal': normals,
             'morton': morton_vals,
             'obj_id': obj_id_vals
         }
