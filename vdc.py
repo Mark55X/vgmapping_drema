@@ -397,15 +397,12 @@ class VariationAwareDensityController:
         # 1. Deleted Objects: Voxels along r_u with TSDF value F <= tau_p were prior surfaces
         #    in the map, but are now traversed without obstruction by the current camera ray.
         # 2. Floaters / Noise: Voxels with F > 0.95 where spurious Gaussians were created in free space.
-        # 3. Dynamic Transition: Voxels with F > tau_p and W <= max_weight transitioning towards free space.
         F_ray_vals, W_ray_vals = tsdf_map.query_tsdf_and_weight(p_w_valid_rays)
         
-        max_w = getattr(tsdf_map, 'max_weight', 15.0)
         deleted_object_mask = (F_ray_vals <= self.tau_p) & (W_ray_vals > 0.5)
         floater_mask = (F_ray_vals > 0.95)
-        transition_mask = (F_ray_vals > self.tau_p) & (W_ray_vals <= max_w)
         
-        prune_points_mask = deleted_object_mask | floater_mask | transition_mask
+        prune_points_mask = deleted_object_mask | floater_mask
         p_w_free_rays = p_w_valid_rays[prune_points_mask]
 
         if len(p_w_free_rays) == 0:
