@@ -126,11 +126,13 @@ class VariationAwareDensityController:
         tau_s: float = 0.6,
         tau_p: float = 0.2,
         near_plane: float = 0.1,
+        safety_margin_factor: float = 1.0,
         device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ):
         self.tau_s = tau_s
         self.tau_p = tau_p
         self.n_p = near_plane
+        self.safety_margin_factor = float(safety_margin_factor)
         self.device = device
 
     def detect_and_initialize_gaussians(
@@ -356,7 +358,8 @@ class VariationAwareDensityController:
         max_tsdf_extent = float(max(tsdf_map.grid_dim) * s)
         window_len = max(0.60, min(1.2, max_tsdf_extent * 0.707))
 
-        safety_margin = max(0.015, 1.5 * s)
+        factor = getattr(self, 'safety_margin_factor', 1.0)
+        safety_margin = max(0.005, factor * s)
         z_end = torch.clamp(depth_vals - safety_margin, min=self.n_p).unsqueeze(1) # (R, 1)
         z_start = torch.clamp(z_end - window_len, min=self.n_p) # (R, 1)
 
