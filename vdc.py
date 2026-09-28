@@ -354,9 +354,9 @@ class VariationAwareDensityController:
         # Dynamically compute the active ray window from the TSDF bounding box dimensions.
         # Sample with sub-voxel resolution (0.5 * voxel_size) along the active optical path.
         max_tsdf_extent = float(max(tsdf_map.grid_dim) * s)
-        window_len = max(0.40, min(1.0, max_tsdf_extent * 0.707))
+        window_len = max(0.60, min(1.2, max_tsdf_extent * 0.707))
 
-        safety_margin = max(0.005, 0.5 * s)
+        safety_margin = max(0.015, 1.5 * s)
         z_end = torch.clamp(depth_vals - safety_margin, min=self.n_p).unsqueeze(1) # (R, 1)
         z_start = torch.clamp(z_end - window_len, min=self.n_p) # (R, 1)
 
@@ -387,13 +387,23 @@ class VariationAwareDensityController:
 
         p_w_valid_rays = p_w_flat[inside_rays]
 
-        # TSDF Surface Consistency Check:
-        # A ray sample is only considered true free space if F > 0.15 or unobserved (W <= 1.0).
-        # Confirmed solid surfaces (|F| <= 0.15 with W > 1.0) observed by ANY camera are PROTECTED
-        # from cross-view raycast over-pruning.
+        # VG-Mapping Frustum Raycasting Pruning (arXiv:2510.09962, Sec III-B.2, Eq. 17):
+        # All points in p_w_valid_rays lie strictly along line-of-sight ray r_u with z < D[u] - s,
+        # representing confirmed unoccupied free space in the current camera frame.
+        #
+        # 1. Deleted Objects: Voxels along r_u with TSDF value F <= tau_p were prior surfaces
+        #    in the map, but are now traversed without obstruction by the current camera ray.
+        # 2. Floaters / Noise: Voxels with F > 0.95 where spurious Gaussians were created in free space.
+        # 3. Dynamic Transition: Voxels with F > tau_p and W <= max_weight transitioning towards free space.
         F_ray_vals, W_ray_vals = tsdf_map.query_tsdf_and_weight(p_w_valid_rays)
-        free_space_mask = (F_ray_vals > 0.15) | (W_ray_vals <= 1.0)
-        p_w_free_rays = p_w_valid_rays[free_space_mask]
+        
+        max_w = getattr(tsdf_map, 'max_weight', 15.0)
+        deleted_object_mask = (F_ray_vals <= self.tau_p) & (W_ray_vals > 0.5)
+        floater_mask = (F_ray_vals > 0.95)
+        transition_mask = (F_ray_vals > self.tau_p) & (W_ray_vals <= max_w)
+        
+        prune_points_mask = deleted_object_mask | floater_mask | transition_mask
+        p_w_free_rays = p_w_valid_rays[prune_points_mask]
 
         if len(p_w_free_rays) == 0:
             return torch.zeros(len(gaussian_morton_codes), dtype=torch.bool, device=self.device)

@@ -54,6 +54,7 @@ class TSDFVoxelMap:
         noise_threshold: float = 0.05,
         grid_dim: Tuple[int, int, int] = (256, 256, 256),
         origin: Tuple[float, float, float] = (-1.28, -1.28, -1.28),
+        max_weight: float = 15.0,
         device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ):
         self.voxel_size = voxel_size
@@ -61,6 +62,7 @@ class TSDFVoxelMap:
         self.epsilon_F = noise_threshold
         self.grid_dim = grid_dim
         self.origin = torch.tensor(origin, dtype=torch.float32, device=device)
+        self.max_weight = max_weight
         self.device = device
 
         # TSDF storage: F(p) in [-1, 1], W(p) >= 0
@@ -193,7 +195,7 @@ class TSDFVoxelMap:
         # F(p) = (|W_t| * F_t + W * F) / (|W_t| + W)
         abs_W_t = torch.abs(W_t)
         F_new = (abs_W_t * F_t + W_old * F_old) / (abs_W_t + W_old + 1e-6)
-        W_new = torch.clamp(W_old + W_t, min=1.0)
+        W_new = torch.clamp(W_old + W_t, min=1.0, max=self.max_weight)
 
         flat_F[indices_update] = F_new
         flat_W[indices_update] = W_new

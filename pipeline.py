@@ -20,11 +20,13 @@ class NativeVGMappingRecurGSPipeline:
         voxel_size: float = 0.01,
         grid_dim: Tuple[int, int, int] = (256, 256, 256),
         origin: Tuple[float, float, float] = (-1.28, -1.28, -1.28),
+        max_weight: float = 15.0,
+        tau_p: float = 0.2,
         device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ):
         self.device = device
-        self.tsdf_map = TSDFVoxelMap(voxel_size=voxel_size, grid_dim=grid_dim, origin=origin, device=device)
-        self.vdc = VariationAwareDensityController(device=device)
+        self.tsdf_map = TSDFVoxelMap(voxel_size=voxel_size, grid_dim=grid_dim, origin=origin, max_weight=max_weight, device=device)
+        self.vdc = VariationAwareDensityController(tau_p=tau_p, device=device)
         self.se3_aligner = RecurGSLieAlgebraAligner(device=device)
 
         # Gaussian scene representation storage
@@ -58,14 +60,11 @@ class NativeVGMappingRecurGSPipeline:
     ) -> Dict[str, torch.Tensor]:
         """
         Processes incoming RGB-D frame at timestamp t:
-        1. TSDF frustum depth integration
-        2. VDC Morton-code raycast pruning of deleted objects & floaters
+        1. VDC Morton-code raycast pruning of deleted objects & floaters against prior TSDF map
+        2. TSDF frustum depth integration
         3. AVD & GVD variation detection + surface-normal guided Gaussian initialization
         """
-        # Step 1: Integrate TSDF
-        self.tsdf_map.integrate_depth_frame(depth, intrinsic, pose)
-
-        # Step 2: Morton raycast pruning
+        # Step 1: Morton raycast pruning (evaluates ray free-space against prior TSDF map)
         prune_mask = self.vdc.prune_gaussians_via_morton(
             depth_obs=depth,
             intrinsic=intrinsic,
@@ -81,7 +80,10 @@ class NativeVGMappingRecurGSPipeline:
             self.gaussians['scale'] = self.gaussians['scale'][keep_mask]
             self.gaussians['morton'] = self.gaussians['morton'][keep_mask]
 
-        # Step 3: AVD & GVD initialization
+        # Step 2: Integrate TSDF depth frame
+        self.tsdf_map.integrate_depth_frame(depth, intrinsic, pose)
+
+        # Step 3: AVD & GVD initialization using updated TSDF geometry
         new_gaussians = self.vdc.detect_and_initialize_gaussians(
             rgb_obs=rgb,
             depth_obs=depth,
