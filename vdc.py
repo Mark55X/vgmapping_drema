@@ -278,13 +278,19 @@ class VariationAwareDensityController:
         norm_grad = torch.norm(grad_s, dim=-1, keepdim=True) + 1e-8
         normals = grad_s / norm_grad # (N_init, 3)
 
-        # Eq. (16): Anisotropic Gaussian scaling S = diag(s_major, s_minor, s_minor)
+        # Eq. (15-16): Scale matrix S = d * diag(n / ||n||_2) biased toward surface tangent plane
         s = tsdf_map.voxel_size
-        s_major = (patch_sizes_init.float() / fx) * d_vals_init
-        s_minor = torch.full_like(s_major, s * 0.5)
+        L_half = patch_sizes_init.float() * 0.5
+        d = (L_half / fx) * d_vals_init # (N_init,)
+        d = torch.clamp(d, min=s * 0.8) # Ensure Gaussian seals voxel gaps
 
-        S_diag = torch.stack([s_major, s_minor, s_minor], dim=-1)
-        S_diag = torch.clamp(S_diag, min=1e-4)
+        grad_abs = torch.abs(grad_s) # (N_init, 3)
+        n_vec = 1.0 / (1.0 + grad_abs) # (N_init, 3) Eq. 16
+        n_norm = torch.norm(n_vec, dim=-1, keepdim=True) + 1e-8
+        n_hat = n_vec / n_norm # (N_init, 3)
+
+        S_diag = d.unsqueeze(-1) * n_hat # (N_init, 3) Eq. 15
+        S_diag = torch.clamp(S_diag, min=s * 0.3)
 
         # Sample RGB color
         rgb_vals = rgb_obs[:, v_init, u_init].T # (N_init, 3)
