@@ -389,6 +389,14 @@ class VariationAwareDensityController:
         p_cam_flat = p_cam.reshape(-1, 3) # (R*S, 3)
         p_w_flat = p_cam_flat @ R_c2w.T + t_c2w # (R*S, 3)
 
+        # Compute confirmed surface points currently observed at depth D[u]
+        x_surf = (grid_u.float() - cx) * depth_vals / fx
+        y_surf = (grid_v.float() - cy) * depth_vals / fy
+        p_cam_surf = torch.stack([x_surf, y_surf, depth_vals], dim=-1)
+        p_w_surf = p_cam_surf @ R_c2w.T + t_c2w
+        curr_surf_mortons = tsdf_map.point_to_morton(p_w_surf).unique()
+        curr_surf_mortons = curr_surf_mortons[curr_surf_mortons >= 0]
+
         # Only ray samples strictly inside the TSDF grid boundary are evaluated
         inside_rays = tsdf_map.is_inside_grid(p_w_flat)
         if not torch.any(inside_rays):
@@ -416,6 +424,10 @@ class VariationAwareDensityController:
 
         bad_mortons = tsdf_map.point_to_morton(p_w_free_rays).unique()
         bad_mortons = bad_mortons[bad_mortons >= 0] # exclude invalid sentinel -1
+
+        # Exclude confirmed surface voxels: by definition they are observed present, not deleted
+        if len(curr_surf_mortons) > 0 and len(bad_mortons) > 0:
+            bad_mortons = bad_mortons[~torch.isin(bad_mortons, curr_surf_mortons)]
 
         prune_mask = torch.zeros(len(gaussian_morton_codes), dtype=torch.bool, device=self.device)
         valid_g_mask = (gaussian_morton_codes >= 0)
