@@ -155,7 +155,7 @@ class VariationAwareDensityController:
         """
         Runs vectorized AVD and GVD passes over quadtree image patches to initialize new Gaussian primitives.
         """
-        u_c, v_c, patch_sizes = quadtree_segmentation_vectorized(rgb_obs, min_size=4, max_size=16, threshold=0.003)
+        u_c, v_c, patch_sizes = quadtree_segmentation_vectorized(rgb_obs, min_size=4, max_size=8, threshold=0.003)
         if len(u_c) == 0:
             return {
                 'xyz': torch.empty((0, 3), device=self.device),
@@ -323,7 +323,8 @@ class VariationAwareDensityController:
         tsdf_map: TSDFVoxelMap,
         gaussian_morton_codes: torch.Tensor,
         stride: int = 2,
-        num_steps: Optional[int] = None
+        num_steps: Optional[int] = None,
+        confirmed_surface_mortons: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Vectorized frustum ray-casting (Eq. 17) in GPU batch.
@@ -426,8 +427,12 @@ class VariationAwareDensityController:
         bad_mortons = bad_mortons[bad_mortons >= 0] # exclude invalid sentinel -1
 
         # Exclude confirmed surface voxels: by definition they are observed present, not deleted
-        if len(curr_surf_mortons) > 0 and len(bad_mortons) > 0:
-            bad_mortons = bad_mortons[~torch.isin(bad_mortons, curr_surf_mortons)]
+        surf_m = curr_surf_mortons
+        if confirmed_surface_mortons is not None and len(confirmed_surface_mortons) > 0:
+            surf_m = torch.cat([curr_surf_mortons, confirmed_surface_mortons]).unique()
+
+        if len(surf_m) > 0 and len(bad_mortons) > 0:
+            bad_mortons = bad_mortons[~torch.isin(bad_mortons, surf_m)]
 
         prune_mask = torch.zeros(len(gaussian_morton_codes), dtype=torch.bool, device=self.device)
         valid_g_mask = (gaussian_morton_codes >= 0)
