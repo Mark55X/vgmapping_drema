@@ -125,12 +125,14 @@ class VariationAwareDensityController:
         self,
         tau_s: float = 0.6,
         tau_p: float = 0.2,
+        tau_floater: float = 0.95,
         near_plane: float = 0.1,
         safety_margin_factor: float = 1.0,
         device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ):
         self.tau_s = tau_s
         self.tau_p = tau_p
+        self.tau_floater = tau_floater
         self.n_p = near_plane
         self.safety_margin_factor = float(safety_margin_factor)
         self.device = device
@@ -415,7 +417,7 @@ class VariationAwareDensityController:
         F_ray_vals, W_ray_vals = tsdf_map.query_tsdf_and_weight(p_w_valid_rays)
         
         deleted_object_mask = (F_ray_vals <= self.tau_p) & (W_ray_vals > 0.5)
-        floater_mask = (F_ray_vals > 0.95)
+        floater_mask = (F_ray_vals > self.tau_floater)
         
         prune_points_mask = deleted_object_mask | floater_mask
         p_w_free_rays = p_w_valid_rays[prune_points_mask]
@@ -440,3 +442,30 @@ class VariationAwareDensityController:
             prune_mask[valid_g_mask] = torch.isin(gaussian_morton_codes[valid_g_mask], bad_mortons)
 
         return prune_mask
+
+    def prune_floaters_via_tsdf(
+        self,
+        gaussian_xyz: torch.Tensor,
+        tsdf_map: TSDFVoxelMap,
+        tau_floater: Optional[float] = None
+    ) -> torch.Tensor:
+        """
+        Prunes floating Gaussians sitting in confirmed free space (TSDF value F > tau_floater).
+        Paper reference: Sec. III-B.2, page 5:
+        "In addition, considering that localization errors and depth noise may cause voxels 
+        and Gaussian primitives to be allocated in regions not belonging to the actual surface 
+        during initialization, we identify voxels with TSDF values greater than 0.95 and prune 
+        their associated Gaussian primitives."
+        """
+        if len(gaussian_xyz) == 0:
+            return torch.zeros(0, dtype=torch.bool, device=self.device)
+        
+        thresh = self.tau_floater if tau_floater is None else tau_floater
+        inside = tsdf_map.is_inside_grid(gaussian_xyz)
+        if not torch.any(inside):
+            return torch.zeros(len(gaussian_xyz), dtype=torch.bool, device=self.device)
+        
+        f_vals, w_vals = tsdf_map.query_tsdf_and_weight(gaussian_xyz)
+        # Gaussian is a confirmed floater if inside grid, F > tau_floater and W >= 1.0 (free space verified by rays)
+        is_floater = inside & (f_vals > thresh) & (w_vals >= 1.0)
+        return is_floater
