@@ -163,8 +163,10 @@ class VariationAwareDensityController:
                 'xyz': torch.empty((0, 3), device=self.device),
                 'rgb': torch.empty((0, 3), device=self.device),
                 'scale': torch.empty((0, 3), device=self.device),
+                'normal': torch.empty((0, 3), device=self.device),
                 'morton': torch.empty((0,), dtype=torch.int64, device=self.device),
-                'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device)
+                'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device),
+                'eviction_mortons': torch.empty((0,), dtype=torch.int64, device=self.device)
             }
 
         ssim_map = compute_ssim_map(rendered_rgb, rgb_obs).squeeze() # (H, W)
@@ -188,8 +190,10 @@ class VariationAwareDensityController:
                 'xyz': torch.empty((0, 3), device=self.device),
                 'rgb': torch.empty((0, 3), device=self.device),
                 'scale': torch.empty((0, 3), device=self.device),
+                'normal': torch.empty((0, 3), device=self.device),
                 'morton': torch.empty((0,), dtype=torch.int64, device=self.device),
-                'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device)
+                'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device),
+                'eviction_mortons': torch.empty((0,), dtype=torch.int64, device=self.device)
             }
 
         d_vals = depth_obs[0, v_c, u_c]
@@ -205,8 +209,10 @@ class VariationAwareDensityController:
                 'xyz': torch.empty((0, 3), device=self.device),
                 'rgb': torch.empty((0, 3), device=self.device),
                 'scale': torch.empty((0, 3), device=self.device),
+                'normal': torch.empty((0, 3), device=self.device),
                 'morton': torch.empty((0,), dtype=torch.int64, device=self.device),
-                'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device)
+                'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device),
+                'eviction_mortons': torch.empty((0,), dtype=torch.int64, device=self.device)
             }
 
         # Sample semantic mask IDs for patches
@@ -259,6 +265,37 @@ class VariationAwareDensityController:
         else:
             init_mask = in_workspace & (~is_robot) & (is_dynamic_obj | avd_flag | gvd_flag)
 
+        # Collect morton codes of surface voxels inside changed AVD regions for eviction
+        # Sample with stride 2 over pixels where ssim_map < self.tau_s
+        changed_pixels_mask = (ssim_map < self.tau_s) & (depth_obs[0] > 0.1) & (depth_obs[0] < 5.0)
+        if mask_obs is not None and robot_ids is not None and len(robot_ids) > 0:
+            if mask_obs.dim() == 3:
+                mask_obs_2d = mask_obs.squeeze(0)
+            else:
+                mask_obs_2d = mask_obs
+            r_tensor = torch.tensor(list(robot_ids), device=self.device, dtype=mask_obs_2d.dtype)
+            changed_pixels_mask = changed_pixels_mask & (~torch.isin(mask_obs_2d, r_tensor))
+
+        v_ch, u_ch = torch.where(changed_pixels_mask)
+        if len(u_ch) > 0:
+            d_ch = depth_obs[0, v_ch, u_ch]
+            x_cam_ch = (u_ch.float() - cx) * d_ch / fx
+            y_cam_ch = (v_ch.float() - cy) * d_ch / fy
+            p_cam_ch = torch.stack([x_cam_ch, y_cam_ch, d_ch], dim=-1)
+            p_w_ch = p_cam_ch @ R_c2w.T + t_c2w
+            if workspace_bounds is not None:
+                min_b, max_b = workspace_bounds
+                in_ws = (
+                    (p_w_ch[:, 0] >= min_b[0]) & (p_w_ch[:, 0] <= max_b[0]) &
+                    (p_w_ch[:, 1] >= min_b[1]) & (p_w_ch[:, 1] <= max_b[1]) &
+                    (p_w_ch[:, 2] >= min_b[2]) & (p_w_ch[:, 2] <= max_b[2])
+                )
+                p_w_ch = p_w_ch[in_ws]
+            eviction_mortons = tsdf_map.point_to_morton(p_w_ch).unique()
+            eviction_mortons = eviction_mortons[eviction_mortons >= 0]
+        else:
+            eviction_mortons = torch.empty((0,), dtype=torch.int64, device=self.device)
+
         if not torch.any(init_mask):
             return {
                 'xyz': torch.empty((0, 3), device=self.device),
@@ -266,7 +303,8 @@ class VariationAwareDensityController:
                 'scale': torch.empty((0, 3), device=self.device),
                 'normal': torch.empty((0, 3), device=self.device),
                 'morton': torch.empty((0,), dtype=torch.int64, device=self.device),
-                'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device)
+                'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device),
+                'eviction_mortons': eviction_mortons
             }
 
         p_world_init = p_world[init_mask]
@@ -314,7 +352,8 @@ class VariationAwareDensityController:
             'scale': S_diag,
             'normal': normals,
             'morton': morton_vals,
-            'obj_id': obj_id_vals
+            'obj_id': obj_id_vals,
+            'eviction_mortons': eviction_mortons
         }
 
     def prune_gaussians_via_morton(
@@ -411,15 +450,11 @@ class VariationAwareDensityController:
         # All points in p_w_valid_rays lie strictly along line-of-sight ray r_u with z < D[u] - s,
         # representing confirmed unoccupied free space in the current camera frame.
         #
-        # 1. Deleted Objects: Voxels along r_u with TSDF value F <= tau_p were prior surfaces
-        #    in the map, but are now traversed without obstruction by the current camera ray.
-        # 2. Floaters / Noise: Voxels with F > 0.95 where spurious Gaussians were created in free space.
+        # Any prior Gaussian in this unoccupied volume is either a deleted object (F <= tau_p)
+        # or free space verified by ray observations (W > 0.5).
         F_ray_vals, W_ray_vals = tsdf_map.query_tsdf_and_weight(p_w_valid_rays)
         
-        deleted_object_mask = (F_ray_vals <= self.tau_p) & (W_ray_vals > 0.5)
-        floater_mask = (F_ray_vals > self.tau_floater)
-        
-        prune_points_mask = deleted_object_mask | floater_mask
+        prune_points_mask = (F_ray_vals <= self.tau_p) | (W_ray_vals > 0.5)
         p_w_free_rays = p_w_valid_rays[prune_points_mask]
 
         if len(p_w_free_rays) == 0:

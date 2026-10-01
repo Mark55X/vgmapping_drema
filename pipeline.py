@@ -39,8 +39,23 @@ class NativeVGMappingRecurGSPipeline:
 
     def add_gaussians(self, new_gaussians: Dict[str, torch.Tensor]):
         """
-        Adds newly initialized Gaussians to current scene representation.
+        Adds newly initialized Gaussians to current scene representation,
+        evicting stale Gaussians in changed AVD regions.
         """
+        # Hybrid AVD Eviction: evict stale Gaussians in changed regions
+        evict_mortons = new_gaussians.get('morton', torch.empty((0,), dtype=torch.int64, device=self.device))
+        if 'eviction_mortons' in new_gaussians and len(new_gaussians['eviction_mortons']) > 0:
+            evict_mortons = torch.cat([evict_mortons, new_gaussians['eviction_mortons']]).unique()
+        evict_mortons = evict_mortons[evict_mortons >= 0]
+
+        if len(self.gaussians['morton']) > 0 and len(evict_mortons) > 0:
+            stale_mask = torch.isin(self.gaussians['morton'], evict_mortons) & (self.gaussians['morton'] >= 0)
+            if torch.any(stale_mask):
+                keep_mask = ~stale_mask
+                for k in ['xyz', 'rgb', 'scale', 'morton']:
+                    if k in self.gaussians and len(self.gaussians[k]) == len(keep_mask):
+                        self.gaussians[k] = self.gaussians[k][keep_mask]
+
         if len(new_gaussians['xyz']) == 0:
             return
 
