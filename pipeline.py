@@ -40,29 +40,28 @@ class NativeVGMappingRecurGSPipeline:
     def add_gaussians(self, new_gaussians: Dict[str, torch.Tensor]):
         """
         Adds newly initialized Gaussians to current scene representation,
-        evicting stale Gaussians in changed AVD regions.
+        preventing redundant initialization on already occupied voxels (GVD Paper Sec. III-B.1).
         """
-        # Hybrid AVD Eviction: evict stale Gaussians in changed regions
-        evict_mortons = new_gaussians.get('morton', torch.empty((0,), dtype=torch.int64, device=self.device))
-        if 'eviction_mortons' in new_gaussians and len(new_gaussians['eviction_mortons']) > 0:
-            evict_mortons = torch.cat([evict_mortons, new_gaussians['eviction_mortons']]).unique()
-        evict_mortons = evict_mortons[evict_mortons >= 0]
-
-        if len(self.gaussians['morton']) > 0 and len(evict_mortons) > 0:
-            stale_mask = torch.isin(self.gaussians['morton'], evict_mortons) & (self.gaussians['morton'] >= 0)
-            if torch.any(stale_mask):
-                keep_mask = ~stale_mask
-                for k in ['xyz', 'rgb', 'scale', 'morton']:
-                    if k in self.gaussians and len(self.gaussians[k]) == len(keep_mask):
-                        self.gaussians[k] = self.gaussians[k][keep_mask]
-
         if len(new_gaussians['xyz']) == 0:
             return
 
-        self.gaussians['xyz'] = torch.cat([self.gaussians['xyz'], new_gaussians['xyz']], dim=0)
-        self.gaussians['rgb'] = torch.cat([self.gaussians['rgb'], new_gaussians['rgb']], dim=0)
-        self.gaussians['scale'] = torch.cat([self.gaussians['scale'], new_gaussians['scale']], dim=0)
-        self.gaussians['morton'] = torch.cat([self.gaussians['morton'], new_gaussians['morton']], dim=0)
+        added_xyz = new_gaussians['xyz']
+        added_rgb = new_gaussians['rgb']
+        added_scale = new_gaussians['scale']
+        added_morton = new_gaussians['morton']
+
+        if len(self.gaussians['morton']) > 0 and len(added_morton) > 0:
+            unoccupied = ~torch.isin(added_morton, self.gaussians['morton'])
+            added_xyz = added_xyz[unoccupied]
+            added_rgb = added_rgb[unoccupied]
+            added_scale = added_scale[unoccupied]
+            added_morton = added_morton[unoccupied]
+
+        if len(added_xyz) > 0:
+            self.gaussians['xyz'] = torch.cat([self.gaussians['xyz'], added_xyz], dim=0)
+            self.gaussians['rgb'] = torch.cat([self.gaussians['rgb'], added_rgb], dim=0)
+            self.gaussians['scale'] = torch.cat([self.gaussians['scale'], added_scale], dim=0)
+            self.gaussians['morton'] = torch.cat([self.gaussians['morton'], added_morton], dim=0)
 
     def process_frame(
         self,
