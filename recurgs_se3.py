@@ -184,14 +184,14 @@ def icp_coarse_alignment(
         matched_tgt = tgt[min_idx]
 
         # 2. Outlier rejection: threshold by max_dist_thresh or 85th percentile
-        thresh = min(max_dist_thresh, torch.quantile(min_dists, 0.90).item() * 1.5 + 1e-4)
+        # Threshold computed in float64 then compared in float32, exactly as the former Python-float version did.
+        thresh = torch.clamp(torch.quantile(min_dists, 0.90).double() * 1.5 + 1e-4, max=max_dist_thresh).to(min_dists.dtype)
         valid_mask = min_dists <= thresh
-        
-        if valid_mask.sum() < 4:
-            valid_mask = min_dists <= torch.quantile(min_dists, 0.50)
+        valid_mask = torch.where(valid_mask.sum() < 4, min_dists <= torch.quantile(min_dists, 0.50), valid_mask)
 
-        src_valid = src[valid_mask]
-        tgt_valid = matched_tgt[valid_mask]
+        valid_idx = torch.nonzero(valid_mask).squeeze(1)
+        src_valid = src[valid_idx]
+        tgt_valid = matched_tgt[valid_idx]
 
         # 3. Compute Centroids
         src_mean = src_valid.mean(dim=0, keepdim=True)
@@ -206,11 +206,11 @@ def icp_coarse_alignment(
             U, S, Vh = torch.linalg.svd(H)
             R = Vh.T @ U.T
 
-            # Reflection correction
-            if torch.det(R) < 0:
-                Vh_corr = Vh.clone()
-                Vh_corr[2, :] *= -1
-                R = Vh_corr.T @ U.T
+            # Reflection correction (branch-free: multiplying by +1 leaves R bit-identical)
+            reflect = torch.where(torch.det(R) < 0, -1.0, 1.0).to(dtype)
+            Vh_corr = Vh.clone()
+            Vh_corr[2, :] *= reflect
+            R = Vh_corr.T @ U.T
 
             t = tgt_mean.squeeze() - src_mean.squeeze() @ R.T
 
@@ -224,9 +224,9 @@ def icp_coarse_alignment(
             T_accum = T_step @ T_accum
 
             # Early stopping check on step magnitude
-            angle = torch.norm(torch.tensor([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]], device=device)) * 0.5
+            angle = torch.norm(torch.stack([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]]).float()) * 0.5
             trans_norm = torch.norm(t)
-            if angle < 1e-4 and trans_norm < 1e-4:
+            if bool((angle < 1e-4) & (trans_norm < 1e-4)):
                 break
         except Exception:
             break
@@ -276,11 +276,14 @@ class RecurGSLieAlgebraAligner(nn.Module):
         num_iterations: int = 15,
         icp_max_iters: int = 12,
         lr: float = 3e-3,
-        tol: float = 1e-5
+        tol: float = 1e-5,
+        early_stop_check_interval: int = 4
     ) -> Dict[int, torch.Tensor]:
         """
         Simultaneously refines SE(3) poses for K dynamic objects.
-        
+        early_stop_check_interval: iterations between host-side convergence checks; the result is identical
+        for any value, larger values trade a few extra iterations for fewer device syncs.
+
         objects_source: Dict mapping obj_id -> {'xyz': (N_k, 3), 'rgb': (N_k, 3)} (canonical or t-1 model)
         objects_target: Optional Dict mapping obj_id -> {'xyz': (M_k, 3), 'rgb': (M_k, 3)} (time t observations)
         Returns: Dict mapping obj_id -> T_fine (4, 4) homogeneous transformation matrix.
@@ -344,6 +347,9 @@ class RecurGSLieAlgebraAligner(nn.Module):
 
         prev_loss = None
         consecutive_small_changes = 0
+        loss_hist = torch.zeros(max(1, num_iterations), device=device)
+        xi_hist = torch.zeros((max(1, num_iterations), K, 6), device=device, dtype=torch.float32)
+        checked_until = 0
 
         # 4. Lie-Algebra Optimization Loop
         for it in range(num_iterations):
@@ -414,10 +420,10 @@ class RecurGSLieAlgebraAligner(nn.Module):
 
                 # C. Physical Table Support Barrier Constraint
                 if z_table is not None:
+                    # relu is exactly 0 (value and gradient) above the table, so no host-side branch is needed.
                     min_z = torch.min(P_trans[:, 2])
-                    if min_z < z_table:
-                        loss_table = F.relu(z_table - min_z) ** 2
-                        obj_loss = obj_loss + self.lambda_table * loss_table
+                    loss_table = F.relu(z_table - min_z) ** 2
+                    obj_loss = obj_loss + self.lambda_table * loss_table
 
                 # D. Upright Regularization (penalizes tilt away from table normal Z)
                 T_c = initial_T_coarse[oid]
@@ -435,17 +441,29 @@ class RecurGSLieAlgebraAligner(nn.Module):
             total_loss.backward()
             optimizer.step()
 
-            # Early stopping check
-            current_loss_val = total_loss.item()
-            if prev_loss is not None:
-                rel_change = abs(prev_loss - current_loss_val) / (prev_loss + 1e-6)
-                if rel_change < tol:
-                    consecutive_small_changes += 1
-                    if consecutive_small_changes >= 3:
-                        break
-                else:
-                    consecutive_small_changes = 0
-            prev_loss = current_loss_val
+            # Early stopping is evaluated in batches to avoid a device sync per iteration. The per-iteration xi
+            # snapshots let us rewind to the exact iteration where the sequential rule would have stopped.
+            loss_hist[it] = total_loss.detach()
+            xi_hist[it] = xi.detach()
+            if (it + 1 - checked_until) < early_stop_check_interval and it != num_iterations - 1:
+                continue
+            stop_at = None
+            for j, current_loss_val in enumerate(loss_hist[checked_until:it + 1].tolist(), start=checked_until):
+                if prev_loss is not None:
+                    rel_change = abs(prev_loss - current_loss_val) / (prev_loss + 1e-6)
+                    if rel_change < tol:
+                        consecutive_small_changes += 1
+                        if consecutive_small_changes >= 3:
+                            stop_at = j
+                            break
+                    else:
+                        consecutive_small_changes = 0
+                prev_loss = current_loss_val
+            checked_until = it + 1
+            if stop_at is not None:
+                with torch.no_grad():
+                    xi.copy_(xi_hist[stop_at])
+                break
 
         # 5. Extract Final Refined Homogeneous SE(3) Matrices
         results = {}
