@@ -55,8 +55,13 @@ class TSDFVoxelMap:
         grid_dim: Tuple[int, int, int] = (256, 256, 256),
         origin: Tuple[float, float, float] = (-1.28, -1.28, -1.28),
         max_weight: float = 15.0,
-        device: str = "cuda" if torch.cuda.is_available() else "cpu"
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        responsive_weights: bool = True
     ):
+        """
+        responsive_weights: Eq. (4) negative weight on changed voxels; False integrates a plain running average,
+        which is what a static multi-view scan needs.
+        """
         self.voxel_size = voxel_size
         self.truncation_margin = truncation_margin
         self.epsilon_F = noise_threshold
@@ -64,6 +69,7 @@ class TSDFVoxelMap:
         self.origin = torch.tensor(origin, dtype=torch.float32, device=device)
         self.max_weight = max_weight
         self.device = device
+        self.responsive_weights = responsive_weights
 
         # TSDF storage: F(p) in [-1, 1], W(p) >= 0
         self.F = torch.ones(grid_dim, dtype=torch.float32, device=device)
@@ -119,14 +125,19 @@ class TSDFVoxelMap:
         intrinsic: torch.Tensor,
         pose: torch.Tensor,
         depth_scale: float = 1.0,
-        max_depth: float = 3.0
+        max_depth: float = 3.0,
+        free_space_mask: Optional[torch.Tensor] = None,
+        free_space_margin: float = 0.0
     ):
         """
         Integrates per-frame depth observation into global TSDF grid following Eq. (2)-(6).
-        
+
         depth: (H, W) depth map in meters (or divided by depth_scale)
         intrinsic: (3, 3) camera intrinsic matrix K
         pose: (4, 4) camera pose T_t = [R_t | t_t] in world frame
+        free_space_mask: (H, W) bool, pixels of other surfaces: they only mark as empty (F = +1) the voxels in front of
+            what they hit, and integrate nothing behind it
+        free_space_margin: how far in front of the hit a voxel must be to count as empty (the depth noise)
         """
         if depth.dim() == 2:
             depth = depth.unsqueeze(0) # (1, H, W)
@@ -174,11 +185,16 @@ class TSDFVoxelMap:
         diff = d_obs - z_obs
         valid_trunc = diff > -self.truncation_margin
 
-        indices_update = indices_obs[valid_trunc]
-        diff_update = diff[valid_trunc]
-        
         # phi(x) = max(-1, min(1, x / mu))
-        F_t = torch.clamp(diff_update / self.truncation_margin, min=-1.0, max=1.0)
+        F_t = torch.clamp(diff / self.truncation_margin, min=-1.0, max=1.0)
+
+        if free_space_mask is not None:
+            free = free_space_mask.reshape(H, W_img).to(self.device)[v_valid, u_valid][valid_depth]
+            valid_trunc = torch.where(free, diff > free_space_margin, valid_trunc)
+            F_t = torch.where(free, torch.ones_like(F_t), F_t)
+
+        indices_update = indices_obs[valid_trunc]
+        F_t = F_t[valid_trunc]
 
         # Get existing TSDF values
         flat_F = self.F.view(-1)
@@ -187,9 +203,12 @@ class TSDFVoxelMap:
         F_old = flat_F[indices_update]
         W_old = flat_W[indices_update]
 
-        # Eq. (4): W_t(p) = 1 if |F_t(p) - F(p)| < epsilon_F else -5
-        change_mask = torch.abs(F_t - F_old) >= self.epsilon_F
-        W_t = torch.where(change_mask, torch.tensor(-5.0, device=self.device), torch.tensor(1.0, device=self.device))
+        if self.responsive_weights:
+            # Eq. (4): W_t(p) = 1 if |F_t(p) - F(p)| < epsilon_F else -5
+            change_mask = torch.abs(F_t - F_old) >= self.epsilon_F
+            W_t = torch.where(change_mask, torch.tensor(-5.0, device=self.device), torch.tensor(1.0, device=self.device))
+        else:
+            W_t = torch.ones_like(F_t)
 
         # Eq. (5) & (6): Global TSDF update with responsive negative weight
         # F(p) = (|W_t| * F_t + W * F) / (|W_t| + W)

@@ -1,5 +1,11 @@
 README.md
+__init__.py
+pipeline.py
+recurgs_se3.py
 setup.py
+test_standalone.py
+tsdf.py
+vdc.py
 ./__init__.py
 ./pipeline.py
 ./recurgs_se3.py
